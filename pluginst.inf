@@ -1,0 +1,5 @@
+[plugininstall]
+description=MSWord_WDX - View data from Word .docx files.
+type=wdx
+file=MSWord_WDX.wdx
+defaultdir=plugins\wdx\MSWord_WDX

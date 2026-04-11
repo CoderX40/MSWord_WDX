@@ -1,6 +1,8 @@
 #include <windows.h>
 #include <string>
 #include <cstring>
+#include <mutex>
+#include <atomic>
 #include <set>
 #include <sstream>
 #include <functional>
@@ -12,6 +14,15 @@
 #include <vector>
 #include "miniz.h"
 #include "tinyxml2.h"
+
+#ifdef _WIN64
+#pragma comment(linker, "/export:ContentGetValue=ContentGetValue")
+#pragma comment(linker, "/export:ContentGetValueW=ContentGetValueW")
+#else
+#pragma comment(linker, "/export:ContentGetSupportedField=_ContentGetSupportedField@16")
+#pragma comment(linker, "/export:ContentGetValue=_ContentGetValue@24")
+#pragma comment(linker, "/export:ContentGetValueW=_ContentGetValueW@24")
+#endif
 
 // Constants for Total Commander field types
 #define ft_nomorefields     0
@@ -29,18 +40,6 @@
 #define ft_fulltextw        12
 #define ft_fieldempty       -3
 #define ft_fileerror        -2
-
-typedef struct {
-WORD wYear;
-WORD wMonth;
-WORD wDay;
-} tdateformat,*pdateformat;
-
-typedef struct {
-WORD wHour;
-WORD wMinute;
-WORD wSecond;
-} ttimeformat,*ptimeformat;
 
 // Field indices for plugin
 enum {
@@ -84,6 +83,56 @@ enum {
     FIELD_COUNT
 };
 
+// --- Runtime globals for optional plugin features ---
+static std::mutex g_cacheMutex;
+struct CachedParts {
+    std::string path;
+    std::string coreXml;
+    std::string appXml;
+    std::string commentsXml;
+    std::string settingsXml;
+    std::string documentXml;
+};
+static CachedParts g_cachedParts;
+static std::atomic<bool> g_cancelRequested{false};
+
+
+bool ExtractFileFromZip(const char* zipPath, const char* fileNameInZip, std::string& output);
+
+bool EnsureCachedParts(const std::string& ansiPath)
+{
+    std::lock_guard<std::mutex> lock(g_cacheMutex);
+    if (g_cachedParts.path == ansiPath)
+        return true;
+
+    g_cachedParts.path.clear();
+    g_cachedParts.coreXml.clear();
+    g_cachedParts.appXml.clear();
+    g_cachedParts.commentsXml.clear();
+    g_cachedParts.settingsXml.clear();
+    g_cachedParts.documentXml.clear();
+
+    ExtractFileFromZip(ansiPath.c_str(), "docProps/core.xml", g_cachedParts.coreXml);
+    ExtractFileFromZip(ansiPath.c_str(), "docProps/app.xml", g_cachedParts.appXml);
+    ExtractFileFromZip(ansiPath.c_str(), "word/comments.xml", g_cachedParts.commentsXml);
+    ExtractFileFromZip(ansiPath.c_str(), "word/settings.xml", g_cachedParts.settingsXml);
+    ExtractFileFromZip(ansiPath.c_str(), "word/document.xml", g_cachedParts.documentXml);
+
+    g_cachedParts.path = ansiPath;
+    return true;
+}
+
+void ClearCache()
+{
+    std::lock_guard<std::mutex> lock(g_cacheMutex);
+    g_cachedParts = CachedParts();
+}
+
+inline bool IsCanceled()
+{
+    return g_cancelRequested.load(std::memory_order_relaxed);
+}
+
 // --- ZIP extraction function using miniz ---
 bool ExtractFileFromZip(const char* zipPath, const char* fileNameInZip, std::string& output)
 {
@@ -99,7 +148,6 @@ bool ExtractFileFromZip(const char* zipPath, const char* fileNameInZip, std::str
         mz_zip_reader_end(&zip_archive);
         return false;
     }
-
     size_t uncompressed_size = 0;
     void* p = mz_zip_reader_extract_file_to_heap(&zip_archive, fileNameInZip, &uncompressed_size, 0);
     if (!p)
@@ -111,6 +159,46 @@ bool ExtractFileFromZip(const char* zipPath, const char* fileNameInZip, std::str
     output.assign(static_cast<char*>(p), uncompressed_size);
     mz_free(p);
     mz_zip_reader_end(&zip_archive);
+    return true;
+}
+
+// --- ANSI / Unicode Conversions ---
+bool WidePathToAnsi(const WCHAR* wpath, std::string& out)
+{
+    if (!wpath) return false;
+    int len = WideCharToMultiByte(CP_ACP, 0, wpath, -1, NULL, 0, NULL, NULL);
+    if (len <= 0) return false;
+    out.resize(len - 1);
+    if (WideCharToMultiByte(CP_ACP, 0, wpath, -1, &out[0], len, NULL, NULL) == 0) return false;
+    return true;
+}
+
+bool Utf8ToWideString(const std::string& in, std::wstring& out)
+{
+    if (in.empty()) { out.clear(); return true; }
+    int needed = MultiByteToWideChar(CP_UTF8, 0, in.c_str(), -1, NULL, 0);
+    if (needed <= 0) return false;
+    out.resize(needed - 1);
+    if (MultiByteToWideChar(CP_UTF8, 0, in.c_str(), -1, &out[0], needed) == 0) return false;
+    return true;
+}
+
+bool FormatSystemTimeToString(const FILETIME& ft_utc, int unitIndex, wchar_t* outputWStr, int maxWLen);
+
+bool FormatSystemTimeToAnsi(const FILETIME& ft_utc, int unitIndex, char* outputStr, int maxLen) {
+    if (outputStr == nullptr || maxLen <= 0) return false;
+
+    int maxWLen = maxLen / static_cast<int>(sizeof(wchar_t));
+    if (maxWLen <= 0) return false;
+
+    std::vector<wchar_t> wbuf(static_cast<size_t>(maxWLen));
+    if (!FormatSystemTimeToString(ft_utc, unitIndex, wbuf.data(), maxWLen)) {
+        return false;
+    }
+
+    int res = WideCharToMultiByte(CP_ACP, 0, wbuf.data(), -1, outputStr, maxLen, NULL, NULL);
+    if (res == 0) return false;
+    outputStr[maxLen - 1] = '\0';
     return true;
 }
 
@@ -176,6 +264,7 @@ std::set<std::string> GetTrackedChangeAuthorsFromAllXml(const char* zipPath)
     mz_uint num_files = mz_zip_reader_get_num_files(&zip_archive);
     for (mz_uint i = 0; i < num_files; ++i)
     {
+        if (IsCanceled()) break;
         mz_zip_archive_file_stat file_stat;
         if (!mz_zip_reader_file_stat(&zip_archive, i, &file_stat))
             continue;
@@ -219,6 +308,7 @@ bool HasTrackedChanges(const char* zipPath)
     mz_uint num_files = mz_zip_reader_get_num_files(&zip_archive);
     for (mz_uint i = 0; i < num_files; ++i)
     {
+        if (IsCanceled()) break;
         mz_zip_archive_file_stat file_stat;
         if (!mz_zip_reader_file_stat(&zip_archive, i, &file_stat))
             continue;
@@ -367,10 +457,6 @@ int GetAnonymisedFlags(const std::string& settingsXmlContent) {
     if (hasPI) flags |= 1;
     if (hasDate) flags |= 2;
     return flags;
-}
-
-bool AreFilesAnonymised(const std::string& settingsXmlContent) {
-    return GetAnonymisedFlags(settingsXmlContent) != 0;
 }
 
 bool HasHiddenTextInDocumentXml(const char* zipPath)
@@ -640,6 +726,8 @@ struct TrackedChangeCounts {
 void CountTrackedChangesRecursive(tinyxml2::XMLElement* elem, TrackedChangeCounts& counts) {
     if (!elem) return;
 
+    if (IsCanceled()) return;
+
     const char* name = elem->Name();
     if (name) {
         if (strcmp(name, "w:ins") == 0) {
@@ -703,6 +791,7 @@ TrackedChangeCounts GetTrackedChangeCounts(const char* zipPath) {
     mz_uint num_files = mz_zip_reader_get_num_files(&zip_archive);
     for (mz_uint i = 0; i < num_files; ++i)
     {
+        if (IsCanceled()) break;
         mz_zip_archive_file_stat file_stat;
         if (!mz_zip_reader_file_stat(&zip_archive, i, &file_stat))
             continue;
@@ -734,6 +823,242 @@ TrackedChangeCounts GetTrackedChangeCounts(const char* zipPath) {
     return counts;
 }
 
+// Unified field result type for shared logic
+struct FieldResult {
+    enum Type { Empty, FileTime, Int32, Int64, Boolean, StringUtf8 } type = Empty;
+    FILETIME ft{};
+    int32_t i32 = 0;
+    int64_t i64 = 0;
+    bool b = false;
+    std::string s; // UTF-8 string representation
+};
+
+// Centralized field extraction: returns neutral FieldResult (UTF-8 for text)
+FieldResult GetFieldResult(const std::string& ansiPath, int fieldIndex, int unitIndex)
+{
+    FieldResult res;
+
+    // Quick extension: validate extension
+    size_t len = ansiPath.length();
+    if (len < 5 || _stricmp(ansiPath.c_str() + len - 5, ".docx") != 0)
+        return res;
+
+    std::string documentXml;
+    std::string commentsXml;
+    std::string settingsXml;
+    std::string coreXml;
+    std::string appXml;
+
+    // Try to use cached parts to avoid repeated ZIP work. If cache doesn't match, EnsureCachedParts will populate it.
+    EnsureCachedParts(ansiPath);
+
+    {
+        std::lock_guard<std::mutex> lock(g_cacheMutex);
+        coreXml = g_cachedParts.coreXml;
+        appXml = g_cachedParts.appXml;
+        commentsXml = g_cachedParts.commentsXml;
+        settingsXml = g_cachedParts.settingsXml;
+        documentXml = g_cachedParts.documentXml;
+    }
+
+    bool needsCoreXml = false;
+    bool needsAppXml = false;
+    bool needsWordXml = false;
+    bool needsCommentsXml = false;
+    bool needsSettingsXml = false;
+
+    switch (fieldIndex) {
+        case FIELD_CORE_TITLE:
+        case FIELD_CORE_SUBJECT:
+        case FIELD_CORE_CREATOR:
+        case FIELD_CORE_KEYWORDS:
+        case FIELD_CORE_DESCRIPTION:
+        case FIELD_CORE_LAST_MODIFIED_BY:
+        case FIELD_CORE_CREATED_DATE:
+        case FIELD_CORE_MODIFIED_DATE:
+        case FIELD_CORE_LAST_PRINTED_DATE:
+        case FIELD_CORE_REVISION_NUMBER:
+            needsCoreXml = true; break;
+        case FIELD_APP_MANAGER:
+        case FIELD_APP_COMPANY:
+        case FIELD_APP_HYPERLINK_BASE:
+        case FIELD_APP_TEMPLATE:
+        case FIELD_APP_PAGES:
+        case FIELD_APP_WORDS:
+        case FIELD_APP_CHARACTERS:
+        case FIELD_APP_LINES:
+        case FIELD_APP_PARAGRAPHS:
+        case FIELD_APP_EDITING_TIME:
+            needsAppXml = true; break;
+        case FIELD_COMPATMODE:
+        case FIELD_COMMENTS:
+            needsCommentsXml = true; break;
+        case FIELD_DOCUMENT_PROTECTION:
+            needsSettingsXml = true; break;
+        case FIELD_AUTO_UPDATE_STYLES:
+        case FIELD_ANONYMISED_FILES:
+        case FIELD_TCS_ON_OFF:
+        case FIELD_HIDDEN_TEXT:
+        case FIELD_TRACKED_CHANGES:
+        case FIELD_TOTAL_REVISIONS:
+        case FIELD_TOTAL_INSERTIONS:
+        case FIELD_TOTAL_DELETIONS:
+        case FIELD_TOTAL_MOVES:
+        case FIELD_TOTAL_FORMATTING_CHANGES:
+            needsWordXml = true; break;
+        case FIELD_AUTHORS:
+        default:
+            break;
+    }
+
+    // If cache did not provide needed parts, fall back to extracting individually.
+    if (needsCoreXml && coreXml.empty()) {
+        if (!ExtractFileFromZip(ansiPath.c_str(), "docProps/core.xml", coreXml)) {
+            res.type = FieldResult::Empty; return res;
+        }
+    }
+    if (needsAppXml && appXml.empty()) {
+        if (!ExtractFileFromZip(ansiPath.c_str(), "docProps/app.xml", appXml)) {
+            res.type = FieldResult::Empty; return res;
+        }
+    }
+    if (needsCommentsXml && commentsXml.empty()) {
+        ExtractFileFromZip(ansiPath.c_str(), "word/comments.xml", commentsXml);
+    }
+    if (needsSettingsXml && settingsXml.empty()) {
+        if (!ExtractFileFromZip(ansiPath.c_str(), "word/settings.xml", settingsXml)) {
+            res.type = FieldResult::Empty; return res;
+        }
+    }
+    if (needsWordXml && documentXml.empty()) {
+        if (!ExtractFileFromZip(ansiPath.c_str(), "word/document.xml", documentXml)) {
+            res.type = FieldResult::Empty; return res;
+        }
+    }
+
+    TrackedChangeCounts trackedCounts;
+    if (fieldIndex >= FIELD_TOTAL_REVISIONS && fieldIndex <= FIELD_TOTAL_FORMATTING_CHANGES) {
+        // Long-running: check cancellation while computing tracked changes.
+        if (IsCanceled()) { res.type = FieldResult::Empty; return res; }
+        trackedCounts = GetTrackedChangeCounts(ansiPath.c_str());
+    }
+
+    switch (fieldIndex) {
+        case FIELD_CORE_TITLE:
+            res.s = GetXmlStringValue(coreXml, "dc:title"); if (res.s.empty()) { res.type = FieldResult::Empty; } else res.type = FieldResult::StringUtf8; break;
+        case FIELD_CORE_SUBJECT:
+            res.s = GetXmlStringValue(coreXml, "dc:subject"); if (res.s.empty()) { res.type = FieldResult::Empty; } else res.type = FieldResult::StringUtf8; break;
+        case FIELD_CORE_CREATOR:
+            res.s = GetXmlStringValue(coreXml, "dc:creator"); if (res.s.empty()) { res.type = FieldResult::Empty; } else res.type = FieldResult::StringUtf8; break;
+        case FIELD_APP_MANAGER:
+            res.s = GetXmlStringValue(appXml, "Manager"); if (res.s.empty()) { res.type = FieldResult::Empty; } else res.type = FieldResult::StringUtf8; break;
+        case FIELD_APP_COMPANY:
+            res.s = GetXmlStringValue(appXml, "Company"); if (res.s.empty()) { res.type = FieldResult::Empty; } else res.type = FieldResult::StringUtf8; break;
+        case FIELD_CORE_KEYWORDS:
+            res.s = GetXmlStringValue(coreXml, "cp:keywords"); if (res.s.empty()) { res.type = FieldResult::Empty; } else res.type = FieldResult::StringUtf8; break;
+        case FIELD_CORE_DESCRIPTION:
+            res.s = GetXmlStringValue(coreXml, "dc:description"); if (res.s.empty()) { res.type = FieldResult::Empty; } else res.type = FieldResult::StringUtf8; break;
+        case FIELD_APP_HYPERLINK_BASE:
+            res.s = GetXmlStringValue(appXml, "HyperlinkBase"); if (res.s.empty()) { res.type = FieldResult::Empty; } else res.type = FieldResult::StringUtf8; break;
+        case FIELD_APP_TEMPLATE:
+            res.s = GetXmlStringValue(appXml, "Template"); if (res.s.empty()) { res.type = FieldResult::Empty; } else res.type = FieldResult::StringUtf8; break;
+        case FIELD_CORE_CREATED_DATE:
+        case FIELD_CORE_MODIFIED_DATE:
+        case FIELD_CORE_LAST_PRINTED_DATE:
+        {
+            std::string dateStr;
+            if (fieldIndex == FIELD_CORE_CREATED_DATE) dateStr = GetXmlStringValue(coreXml, "dcterms:created");
+            else if (fieldIndex == FIELD_CORE_MODIFIED_DATE) dateStr = GetXmlStringValue(coreXml, "dcterms:modified");
+            else if (fieldIndex == FIELD_CORE_LAST_PRINTED_DATE) dateStr = GetXmlStringValue(coreXml, "cp:lastPrinted");
+            if (dateStr.empty()) { res.type = FieldResult::Empty; break; }
+            FILETIME ft_utc;
+            if (!ParseIso8601ToFileTime(dateStr, &ft_utc)) { res.type = FieldResult::Empty; break; }
+            res.ft = ft_utc; res.type = FieldResult::FileTime; break;
+        }
+        case FIELD_CORE_LAST_MODIFIED_BY:
+            res.s = GetXmlStringValue(coreXml, "cp:lastModifiedBy"); if (res.s.empty()) { res.type = FieldResult::Empty; } else res.type = FieldResult::StringUtf8; break;
+        case FIELD_CORE_REVISION_NUMBER:
+            res.i32 = GetXmlIntValue(coreXml, "cp:revision"); res.type = FieldResult::Int32; break;
+        case FIELD_APP_EDITING_TIME:
+            res.i32 = GetXmlIntValue(appXml, "TotalTime"); res.type = FieldResult::Int32; break;
+        case FIELD_APP_PAGES:
+            res.i32 = GetXmlIntValue(appXml, "Pages"); if (res.i32 == 0) { res.type = FieldResult::Empty; } else res.type = FieldResult::Int32; break;
+        case FIELD_APP_PARAGRAPHS:
+            res.i32 = GetXmlIntValue(appXml, "Paragraphs"); if (res.i32 == 0) { res.type = FieldResult::Empty; } else res.type = FieldResult::Int32; break;
+        case FIELD_APP_LINES:
+            res.i32 = GetXmlIntValue(appXml, "Lines"); if (res.i32 == 0) { res.type = FieldResult::Empty; } else res.type = FieldResult::Int32; break;
+        case FIELD_APP_WORDS:
+            res.i32 = GetXmlIntValue(appXml, "Words"); if (res.i32 == 0) { res.type = FieldResult::Empty; } else res.type = FieldResult::Int32; break;
+        case FIELD_APP_CHARACTERS:
+            res.i32 = GetXmlIntValue(appXml, "Characters"); if (res.i32 == 0) { res.type = FieldResult::Empty; } else res.type = FieldResult::Int32; break;
+        case FIELD_COMPATMODE:
+            res.b = IsCompatibilityModeEnabled(settingsXml); res.type = FieldResult::Boolean; break;
+        case FIELD_HIDDEN_TEXT:
+            res.b = HasHiddenTextInDocumentXml(ansiPath.c_str()); res.type = FieldResult::Boolean; break;
+        case FIELD_COMMENTS:
+            res.i32 = CountComments(commentsXml); res.type = FieldResult::Int32; break;
+        case FIELD_DOCUMENT_PROTECTION:
+        {
+            if (settingsXml.empty()) { res.s = "No protection"; res.type = FieldResult::StringUtf8; break; }
+            tinyxml2::XMLDocument doc;
+            if (doc.Parse(settingsXml.c_str()) != tinyxml2::XML_SUCCESS) { res.s = "Error parsing settings.xml"; res.type = FieldResult::StringUtf8; break; }
+            tinyxml2::XMLElement* root = doc.RootElement();
+            if (!root) { res.s = "No protection"; res.type = FieldResult::StringUtf8; break; }
+            tinyxml2::XMLElement* protectionElem = root->FirstChildElement("w:documentProtection");
+            std::string protectionType = "No protection";
+            if (protectionElem) {
+                const char* enforcement = protectionElem->Attribute("w:enforcement");
+                if (enforcement && strcmp(enforcement, "1") == 0) {
+                    const char* edit = protectionElem->Attribute("w:edit");
+                    if (edit) {
+                        if (strcmp(edit, "readOnly") == 0) protectionType = "Read-Only";
+                        else if (strcmp(edit, "forms") == 0) protectionType = "Forms";
+                        else if (strcmp(edit, "comments") == 0) protectionType = "Comments";
+                        else if (strcmp(edit, "trackedChanges") == 0) protectionType = "Tracked Changes";
+                        else protectionType = "Unknown protection type";
+                    } else protectionType = "Unknown protection type";
+                }
+            }
+            res.s = protectionType; res.type = FieldResult::StringUtf8; break;
+        }
+        case FIELD_AUTO_UPDATE_STYLES:
+            res.b = IsAutoUpdateStylesEnabled(settingsXml); res.type = FieldResult::Boolean; break;
+        case FIELD_ANONYMISED_FILES:
+        {
+            int flags = GetAnonymisedFlags(settingsXml);
+            switch (flags) {
+            case 0: res.s = "No"; break;
+            case 1: res.s = "Personal Information"; break;
+            case 2: res.s = "Date and Time"; break;
+            case 3: res.s = "Personal Information, Date and Time"; break;
+            default: res.s = "No"; break;
+            }
+            res.type = FieldResult::StringUtf8; break;
+        }
+        case FIELD_TRACKED_CHANGES:
+            res.b = HasTrackedChanges(ansiPath.c_str()); res.type = FieldResult::Boolean; break;
+        case FIELD_TCS_ON_OFF:
+            res.s = IsTrackChangesEnabled(settingsXml) ? "Activated" : "Deactivated"; res.type = FieldResult::StringUtf8; break;
+        case FIELD_AUTHORS:
+        {
+            auto authors = GetTrackedChangeAuthorsFromAllXml(ansiPath.c_str());
+            if (authors.empty()) { res.type = FieldResult::Empty; break; }
+            std::stringstream ss;
+            bool first = true;
+            for (const auto& author : authors) { if (!first) ss << ", "; ss << author; first = false; }
+            res.s = ss.str(); res.type = FieldResult::StringUtf8; break;
+        }
+        case FIELD_TOTAL_REVISIONS: res.i32 = trackedCounts.totalRevisions; res.type = FieldResult::Int32; break;
+        case FIELD_TOTAL_INSERTIONS: res.i32 = trackedCounts.insertions; res.type = FieldResult::Int32; break;
+        case FIELD_TOTAL_DELETIONS: res.i32 = trackedCounts.deletions; res.type = FieldResult::Int32; break;
+        case FIELD_TOTAL_MOVES: res.i32 = trackedCounts.moves; res.type = FieldResult::Int32; break;
+        case FIELD_TOTAL_FORMATTING_CHANGES: res.i32 = trackedCounts.formattingChanges; res.type = FieldResult::Int32; break;
+        default: res.type = FieldResult::Empty; break;
+    }
+
+    return res;
+}
+
 
 // --- Total Commander Content Plugin API ---
 
@@ -743,6 +1068,7 @@ extern "C" {
     {
         switch (fieldIndex)
         {
+        // Document Properties
         case FIELD_CORE_TITLE:
             strncpy_s(fieldName, maxLen, "Document Title", _TRUNCATE);
             strncpy_s(units, maxLen, "", _TRUNCATE);
@@ -889,465 +1215,155 @@ extern "C" {
         }
     }
 
+    __declspec(dllexport) int __stdcall ContentGetValueW(
+        WCHAR* fileName, int fieldIndex, int unitIndex,
+        void* fieldValue, int maxLen, int flags)
+    {
+        if (!fileName) return ft_fieldempty;
+        std::string ansiPath;
+        if (!WidePathToAnsi(fileName, ansiPath)) return ft_fieldempty;
+
+        g_cancelRequested.store(false, std::memory_order_relaxed);
+
+        FieldResult r = GetFieldResult(ansiPath, fieldIndex, unitIndex);
+        switch (r.type) {
+            case FieldResult::Empty: return ft_fieldempty;
+            case FieldResult::FileTime:
+                if (unitIndex == 0) { memcpy(fieldValue, &r.ft, sizeof(FILETIME)); return ft_datetime; }
+                if (FormatSystemTimeToString(r.ft, unitIndex, static_cast<wchar_t*>(fieldValue), maxLen / sizeof(wchar_t))) return ft_stringw;
+                return ft_fieldempty;
+            case FieldResult::Int32: *(int*)fieldValue = r.i32; return ft_numeric_32;
+            case FieldResult::Int64: *(long long*)fieldValue = r.i64; return ft_numeric_64;
+            case FieldResult::Boolean: *((int*)fieldValue) = r.b ? 1 : 0; return ft_boolean;
+            case FieldResult::StringUtf8:
+            {
+                if (r.s.empty()) { return ft_fieldempty; }
+                if (!fieldValue || maxLen <= 0) return ft_fieldempty;
+                std::wstring w;
+                Utf8ToWideString(r.s, w);
+                wcsncpy_s(static_cast<wchar_t*>(fieldValue), static_cast<size_t>(maxLen / sizeof(wchar_t)), w.c_str(), _TRUNCATE);
+                static_cast<wchar_t*>(fieldValue)[maxLen / sizeof(wchar_t) - 1] = L'\0';
+                return ft_stringw;
+            }
+        }
+        return ft_fieldempty;
+    }
+
     __declspec(dllexport) int __stdcall ContentGetValue(
         char* fileName, int fieldIndex, int unitIndex,
         void* fieldValue, int maxLen, int flags)
     {
-        size_t len = strlen(fileName);
-        if (len < 5 || _stricmp(fileName + len - 5, ".docx") != 0)
-            return ft_fieldempty;
+        if (!fileName) return ft_fieldempty;
+        std::string path = fileName;
 
-        std::string documentXml;
-        std::string commentsXml;
-        std::string settingsXml;
-        std::string coreXml;
-        std::string appXml;
+        g_cancelRequested.store(false, std::memory_order_relaxed);
 
-        bool needsCoreXml = false;
-        bool needsAppXml = false;
-        bool needsWordXml = false;
-        bool needsCommentsXml = false;
-        bool needsSettingsXml = false;
-
-        // Determine which XML files are needed based on the fieldIndex
-        switch (fieldIndex) {
-            case FIELD_CORE_TITLE:
-            case FIELD_CORE_SUBJECT:
-            case FIELD_CORE_CREATOR:
-            case FIELD_CORE_KEYWORDS:
-            case FIELD_CORE_DESCRIPTION:
-            case FIELD_CORE_LAST_MODIFIED_BY:
-            case FIELD_CORE_CREATED_DATE:
-            case FIELD_CORE_MODIFIED_DATE:
-            case FIELD_CORE_LAST_PRINTED_DATE:
-            case FIELD_CORE_REVISION_NUMBER:
-                needsCoreXml = true;
-                break;
-            case FIELD_APP_MANAGER:
-            case FIELD_APP_COMPANY:
-            case FIELD_APP_HYPERLINK_BASE:
-            case FIELD_APP_TEMPLATE:
-            case FIELD_APP_PAGES:
-            case FIELD_APP_WORDS:
-            case FIELD_APP_CHARACTERS:
-            case FIELD_APP_LINES:
-            case FIELD_APP_PARAGRAPHS:
-            case FIELD_APP_EDITING_TIME:
-                needsAppXml = true;
-                break;
-            case FIELD_COMPATMODE:
-            case FIELD_COMMENTS:
-                needsCommentsXml = true;
-                break;
-            case FIELD_DOCUMENT_PROTECTION:
-                needsSettingsXml = true;
-                break;
-            case FIELD_AUTO_UPDATE_STYLES:
-            case FIELD_ANONYMISED_FILES:
-            case FIELD_TCS_ON_OFF:
-            case FIELD_HIDDEN_TEXT:
-            case FIELD_TRACKED_CHANGES:
-            case FIELD_TOTAL_REVISIONS:
-            case FIELD_TOTAL_INSERTIONS:
-            case FIELD_TOTAL_DELETIONS:
-            case FIELD_TOTAL_MOVES:
-            case FIELD_TOTAL_FORMATTING_CHANGES:
-                needsWordXml = true;
-                break;
-            case FIELD_AUTHORS:
-                break;
-            default:
-                break;
-        }
-
-        if (needsCoreXml) {
-            if (!ExtractFileFromZip(fileName, "docProps/core.xml", coreXml)) {
-                return ft_fileerror;
-            }
-        }
-        if (needsAppXml) {
-            if (!ExtractFileFromZip(fileName, "docProps/app.xml", appXml)) {
-                return ft_fileerror;
-            }
-        }
-        if (needsCommentsXml) {
-            if (!ExtractFileFromZip(fileName, "word/comments.xml", commentsXml)) {
-                commentsXml = "";
-            }
-        }
-        if (needsSettingsXml) {
-            if (!ExtractFileFromZip(fileName, "word/settings.xml", settingsXml)) {
-                return ft_fileerror;
-            }
-        }
-        if (needsWordXml) {
-            if (!ExtractFileFromZip(fileName, "word/document.xml", documentXml)) {
-                return ft_fileerror;
-            }
-        }
-
-        TrackedChangeCounts trackedCounts;
-        if (fieldIndex >= FIELD_TOTAL_REVISIONS && fieldIndex <= FIELD_TOTAL_FORMATTING_CHANGES) {
-            trackedCounts = GetTrackedChangeCounts(fileName); // Call the updated function
-        }
-
-
-        switch (fieldIndex)
-        {
-        case FIELD_CORE_TITLE:
-        {
-            std::string title = GetXmlStringValue(coreXml, "dc:title");
-            if (title.empty()) return ft_fieldempty;
-            strncpy_s(static_cast<char*>(fieldValue), maxLen, title.c_str(), _TRUNCATE);
-            static_cast<char*>(fieldValue)[maxLen - 1] = '\0';
-            return ft_string;
-        }
-        case FIELD_CORE_SUBJECT:
-        {
-            std::string subject = GetXmlStringValue(coreXml, "dc:subject");
-            if (subject.empty()) return ft_fieldempty;
-            strncpy_s(static_cast<char*>(fieldValue), maxLen, subject.c_str(), _TRUNCATE);
-            static_cast<char*>(fieldValue)[maxLen - 1] = '\0';
-            return ft_string;
-        }
-        case FIELD_CORE_CREATOR:
-        {
-            std::string creator = GetXmlStringValue(coreXml, "dc:creator");
-            if (creator.empty()) return ft_fieldempty;
-            strncpy_s(static_cast<char*>(fieldValue), maxLen, creator.c_str(), _TRUNCATE);
-            static_cast<char*>(fieldValue)[maxLen - 1] = '\0';
-            return ft_string;
-        }
-        case FIELD_APP_MANAGER:
-        {
-            std::string manager = GetXmlStringValue(appXml, "Manager");
-            if (manager.empty()) return ft_fieldempty;
-            strncpy_s(static_cast<char*>(fieldValue), maxLen, manager.c_str(), _TRUNCATE);
-            static_cast<char*>(fieldValue)[maxLen - 1] = '\0';
-            return ft_string;
-        }
-        case FIELD_APP_COMPANY:
-        {
-            std::string company = GetXmlStringValue(appXml, "Company");
-            if (company.empty()) return ft_fieldempty;
-            strncpy_s(static_cast<char*>(fieldValue), maxLen, company.c_str(), _TRUNCATE);
-            static_cast<char*>(fieldValue)[maxLen - 1] = '\0';
-            return ft_string;
-        }
-        case FIELD_CORE_KEYWORDS:
-        {
-            std::string keywords = GetXmlStringValue(coreXml, "cp:keywords");
-            if (keywords.empty()) return ft_fieldempty;
-            strncpy_s(static_cast<char*>(fieldValue), maxLen, keywords.c_str(), _TRUNCATE);
-            static_cast<char*>(fieldValue)[maxLen - 1] = '\0';
-            return ft_string;
-        }
-        case FIELD_CORE_DESCRIPTION:
-        {
-            std::string description = GetXmlStringValue(coreXml, "dc:description");
-            if (description.empty()) return ft_fieldempty;
-            strncpy_s(static_cast<char*>(fieldValue), maxLen, description.c_str(), _TRUNCATE);
-            static_cast<char*>(fieldValue)[maxLen - 1] = '\0';
-            return ft_string;
-        }
-        case FIELD_APP_HYPERLINK_BASE:
-        {
-            std::string hyperlinkBase = GetXmlStringValue(appXml, "HyperlinkBase");
-            if (hyperlinkBase.empty()) return ft_fieldempty;
-            strncpy_s(static_cast<char*>(fieldValue), maxLen, hyperlinkBase.c_str(), _TRUNCATE);
-            static_cast<char*>(fieldValue)[maxLen - 1] = '\0';
-            return ft_string;
-        }
-        case FIELD_APP_TEMPLATE:
-        {
-            std::string templateName = GetXmlStringValue(appXml, "Template");
-            if (templateName.empty()) return ft_fieldempty;
-            strncpy_s(static_cast<char*>(fieldValue), maxLen, templateName.c_str(), _TRUNCATE);
-            static_cast<char*>(fieldValue)[maxLen - 1] = '\0';
-            return ft_string;
-        }
-        case FIELD_CORE_CREATED_DATE:
-        case FIELD_CORE_MODIFIED_DATE:
-        case FIELD_CORE_LAST_PRINTED_DATE:
-        {
-            std::string dateStr;
-            if (fieldIndex == FIELD_CORE_CREATED_DATE) dateStr = GetXmlStringValue(coreXml, "dcterms:created");
-            else if (fieldIndex == FIELD_CORE_MODIFIED_DATE) dateStr = GetXmlStringValue(coreXml, "dcterms:modified");
-            else if (fieldIndex == FIELD_CORE_LAST_PRINTED_DATE) dateStr = GetXmlStringValue(coreXml, "cp:lastPrinted");
-
-            if (dateStr.empty()) return ft_fieldempty;
-
-            FILETIME ft_utc;
-            if (!ParseIso8601ToFileTime(dateStr, &ft_utc)) {
+        FieldResult r = GetFieldResult(path, fieldIndex, unitIndex);
+        switch (r.type) {
+            case FieldResult::Empty: return ft_fieldempty;
+            case FieldResult::FileTime:
+                if (unitIndex == 0) { memcpy(fieldValue, &r.ft, sizeof(FILETIME)); return ft_datetime; }
+                if (FormatSystemTimeToAnsi(r.ft, unitIndex, static_cast<char*>(fieldValue), maxLen)) return ft_string;
                 return ft_fieldempty;
-            }
+            case FieldResult::Int32: *(int*)fieldValue = r.i32; return ft_numeric_32;
+            case FieldResult::Int64: *(long long*)fieldValue = r.i64; return ft_numeric_64;
+            case FieldResult::Boolean: *((int*)fieldValue) = r.b ? 1 : 0; return ft_boolean;
+            case FieldResult::StringUtf8:
+                if (r.s.empty()) { return ft_fieldempty; }
+                if (!fieldValue || maxLen <= 0) return ft_fieldempty;
+                strncpy_s(static_cast<char*>(fieldValue), maxLen, r.s.c_str(), _TRUNCATE);
+                static_cast<char*>(fieldValue)[maxLen - 1] = '\0';
+                return ft_string;
+        }
+        return ft_fieldempty;
+    }
 
-            if (unitIndex == 0) {
-                memcpy(fieldValue, &ft_utc, sizeof(FILETIME));
-                return ft_datetime;
-            }
-            else {
-                if (FormatSystemTimeToString(ft_utc, unitIndex, static_cast<wchar_t*>(fieldValue), maxLen / sizeof(wchar_t))) {
-                    return ft_stringw;
+    __declspec(dllexport) int __stdcall ContentGetDetectString(char* DetectString, int maxlen)
+    {
+        if (!DetectString || maxlen <= 0) return 1;
+        // Use the minimal detect string to avoid parser issues in older hosts
+        const char* shortOnly = "EXT=docx";
+        size_t needShort = strlen(shortOnly) + 1;
+        if (static_cast<size_t>(maxlen) < needShort) return 1;
+        strcpy_s(DetectString, static_cast<size_t>(maxlen), shortOnly);
+        return 0;
+    }
+
+    __declspec(dllexport) int __stdcall ContentGetDetectStringW(WCHAR* DetectString, int maxlen)
+    {
+        if (!DetectString || maxlen <= 0) return 1;
+        const std::wstring shortOnly = L"EXT=docx";
+        size_t needShort = shortOnly.length() + 1;
+        if (static_cast<size_t>(maxlen) < needShort) return 1;
+        wcscpy_s(DetectString, static_cast<size_t>(maxlen), shortOnly.c_str());
+        return 0;
+    }
+
+    static wchar_t* SafeGetIniPath(void* dparm)
+    {
+        if (!dparm) return nullptr;
+
+#if defined(_MSC_VER)
+        __try {
+            void* pRaw = nullptr;
+            memcpy(&pRaw, reinterpret_cast<char*>(dparm) + sizeof(void*), sizeof(void*));
+            if (pRaw == nullptr) return nullptr;
+
+            wchar_t* pw = static_cast<wchar_t*>(pRaw);
+            size_t maxCheck = 4096;
+            size_t len = 0;
+            __try {
+                for (; len < maxCheck; ++len) {
+                    if (pw[len] == L'\0') break;
                 }
-                return ft_fieldempty;
+            } __except(EXCEPTION_EXECUTE_HANDLER) {
+                return nullptr;
             }
+            if (len == maxCheck) return nullptr;
+            return pw;
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            return nullptr;
         }
-        case FIELD_CORE_LAST_MODIFIED_BY:
-        {
-            std::string lastModifiedBy = GetXmlStringValue(coreXml, "cp:lastModifiedBy");
-            if (lastModifiedBy.empty()) return ft_fieldempty;
-            strncpy_s(static_cast<char*>(fieldValue), maxLen, lastModifiedBy.c_str(), _TRUNCATE);
-            static_cast<char*>(fieldValue)[maxLen - 1] = '\0';
-            return ft_string;
-        }
-        case FIELD_CORE_REVISION_NUMBER:
-        {
-            int revision = GetXmlIntValue(coreXml, "cp:revision");
-            if (revision == 0 && coreXml.empty()) return ft_fileerror;
-            *(int*)fieldValue = revision;
-            return ft_numeric_32;
-        }
-        case FIELD_APP_EDITING_TIME:
-        {
-            int editTime = GetXmlIntValue(appXml, "TotalTime");
-            if (appXml.empty()) return ft_fileerror;
-            *(int*)fieldValue = editTime;
-            return ft_numeric_32;
-        }
-        case FIELD_APP_PAGES:
-        {
-            int pages = GetXmlIntValue(appXml, "Pages");
-            if (pages == 0 && appXml.empty()) return ft_fileerror;
-            if (pages == 0) return ft_fieldempty;
-            *(int*)fieldValue = pages;
-            return ft_numeric_32;
-        }
-        case FIELD_APP_PARAGRAPHS:
-        {
-            int paragraphs = GetXmlIntValue(appXml, "Paragraphs");
-            if (paragraphs == 0 && appXml.empty()) return ft_fileerror;
-            if (paragraphs == 0) return ft_fieldempty;
-            *(int*)fieldValue = paragraphs;
-            return ft_numeric_32;
-        }
-        case FIELD_APP_LINES:
-        {
-            int lines = GetXmlIntValue(appXml, "Lines");
-            if (lines == 0 && appXml.empty()) return ft_fileerror;
-            if (lines == 0) return ft_fieldempty;
-            *(int*)fieldValue = lines;
-            return ft_numeric_32;
-        }
-        case FIELD_APP_WORDS:
-        {
-            int words = GetXmlIntValue(appXml, "Words");
-            if (words == 0 && appXml.empty()) return ft_fileerror;
-            if (words == 0) return ft_fieldempty;
-            *(int*)fieldValue = words;
-            return ft_numeric_32;
-        }
-        case FIELD_APP_CHARACTERS:
-        {
-            int characters = GetXmlIntValue(appXml, "Characters");
-            if (characters == 0 && appXml.empty()) return ft_fileerror;
-            if (characters == 0) return ft_fieldempty;
-            *(int*)fieldValue = characters;
-            return ft_numeric_32;
-        }
+#else
+        void* pRaw = nullptr;
+        memcpy(&pRaw, reinterpret_cast<char*>(dparm) + sizeof(void*), sizeof(void*));
+        if (!pRaw) return nullptr;
+        wchar_t* pw = static_cast<wchar_t*>(pRaw);
+        if (pw[0] == L'\0') return nullptr;
+        return pw;
+#endif
+    }
 
-        case FIELD_COMPATMODE:
-        {
-            if (!ExtractFileFromZip(fileName, "word/settings.xml", settingsXml))
-                return ft_fileerror;
-
-            *((int*)fieldValue) = IsCompatibilityModeEnabled(settingsXml) ? 1 : 0;
-            return ft_boolean;
-        }
-        case FIELD_HIDDEN_TEXT:
-        {
-            bool hasHidden = HasHiddenTextInDocumentXml(fileName);
-            *((int*)fieldValue) = hasHidden ? 1 : 0;
-            return ft_boolean;
-        }
-        case FIELD_COMMENTS:
-        {
-            int commentCount = CountComments(commentsXml);
-            *(int*)fieldValue = commentCount;
-            return ft_numeric_32;
-        }
-        case FIELD_DOCUMENT_PROTECTION:
-        {
-            if (settingsXml.empty()) return ft_fileerror;
-
-            tinyxml2::XMLDocument doc;
-            if (doc.Parse(settingsXml.c_str()) != tinyxml2::XML_SUCCESS) {
-                strncpy_s(static_cast<char*>(fieldValue), maxLen, "Error parsing settings.xml", _TRUNCATE);
-                static_cast<char*>(fieldValue)[maxLen - 1] = '\0';
-                return ft_string;
-            }
-
-            tinyxml2::XMLElement* root = doc.RootElement();
-            if (!root) {
-                strncpy_s(static_cast<char*>(fieldValue), maxLen, "No protection", _TRUNCATE);
-                static_cast<char*>(fieldValue)[maxLen - 1] = '\0';
-                return ft_string;
-            }
-
-            tinyxml2::XMLElement* protectionElem = root->FirstChildElement("w:documentProtection");
-            std::string protectionType = "No protection";
-
-            if (protectionElem) {
-                const char* enforcement = protectionElem->Attribute("w:enforcement");
-                if (enforcement && strcmp(enforcement, "1") == 0) {
-                    const char* edit = protectionElem->Attribute("w:edit");
-                    if (edit) {
-                        if (strcmp(edit, "readOnly") == 0) {
-                            protectionType = "Read-Only";
-                        }
-                        else if (strcmp(edit, "forms") == 0) {
-                            protectionType = "Forms";
-                        }
-                        else if (strcmp(edit, "comments") == 0) {
-                            protectionType = "Comments";
-                        }
-                        else if (strcmp(edit, "trackedChanges") == 0) {
-                            protectionType = "Tracked Changes";
-                        }
-                        else {
-                            protectionType = "Unknown protection type";
-                        }
-                    }
-                    else {
-                        protectionType = "Unknown protection type";
-                    }
-                }
-            }
-
-            strncpy_s(static_cast<char*>(fieldValue), maxLen, protectionType.c_str(), _TRUNCATE);
-            static_cast<char*>(fieldValue)[maxLen - 1] = '\0';
-            return ft_string;
-        }
-
-        case FIELD_AUTO_UPDATE_STYLES:
-        {
-            if (!ExtractFileFromZip(fileName, "word/settings.xml", settingsXml)) {
-                return ft_fileerror;
-            }
-            if (IsAutoUpdateStylesEnabled(settingsXml)) {
-                *(int*)fieldValue = 1;
-            }
-            else {
-                *(int*)fieldValue = 0;
-            }
-            return ft_boolean;
-        }
-        case FIELD_ANONYMISED_FILES:
-        {
-            if (!ExtractFileFromZip(fileName, "word/settings.xml", settingsXml)) {
-                return ft_fileerror;
-            }
-
-            int flags = GetAnonymisedFlags(settingsXml);
-            std::string report;
-            switch (flags) {
-            case 0:
-                report = "No";
-                break;
-            case 1:
-                report = "Personal Information";
-                break;
-            case 2:
-                report = "Date and Time";
-                break;
-            case 3:
-                report = "Personal Information, Date and Time";
-                break;
-            default:
-                report = "No";
-                break;
-            }
-
-            strncpy_s(static_cast<char*>(fieldValue), maxLen, report.c_str(), _TRUNCATE);
-            static_cast<char*>(fieldValue)[maxLen - 1] = '\0';
-            return ft_string;
-        }
-        case FIELD_TRACKED_CHANGES:
-        {
-            bool hasChanges = HasTrackedChanges(fileName); // Call the updated function
-            *((int*)fieldValue) = hasChanges ? 1 : 0;
-            return ft_boolean;
-        }
-        case FIELD_TCS_ON_OFF:
-        {
-            std::string settingsXml;
-            
-            if (!ExtractFileFromZip(fileName, "word/settings.xml", settingsXml)) {
-                strncpy_s(static_cast<char*>(fieldValue), maxLen, "Deactivated", _TRUNCATE);
-                static_cast<char*>(fieldValue)[maxLen - 1] = '\0';
-                return ft_string;
-            }
-
-            if (IsTrackChangesEnabled(settingsXml)) {
-                strncpy_s(static_cast<char*>(fieldValue), maxLen, "Activated", _TRUNCATE);
-            }
-            else {
-                strncpy_s(static_cast<char*>(fieldValue), maxLen, "Deactivated", _TRUNCATE);
-            }
-            static_cast<char*>(fieldValue)[maxLen - 1] = '\0';
-            return ft_string;
-        }
-        case FIELD_AUTHORS:
-        {
-            auto authors = GetTrackedChangeAuthorsFromAllXml(fileName);
-            if (authors.empty())
-                return ft_fieldempty;
-
-            std::stringstream ss;
-            bool first = true;
-            for (const auto& author : authors)
-            {
-                if (!first) ss << ", ";
-                ss << author;
-                first = false;
-            }
-            std::string result = ss.str();
-
-            char* pStr = static_cast<char*>(fieldValue);
-            strncpy_s(pStr, maxLen, result.c_str(), _TRUNCATE);
-            pStr[maxLen - 1] = '\0';
-
-            return ft_string;
-        }
-        case FIELD_TOTAL_REVISIONS:
-        {
-            *(int*)fieldValue = trackedCounts.totalRevisions;
-            return ft_numeric_32;
-        }
-        case FIELD_TOTAL_INSERTIONS:
-        {
-            *(int*)fieldValue = trackedCounts.insertions;
-            return ft_numeric_32;
-        }
-        case FIELD_TOTAL_DELETIONS:
-        {
-            *(int*)fieldValue = trackedCounts.deletions;
-            return ft_numeric_32;
-        }
-        case FIELD_TOTAL_MOVES:
-        {
-            *(int*)fieldValue = trackedCounts.moves;
-            return ft_numeric_32;
-        }
-        case FIELD_TOTAL_FORMATTING_CHANGES:
-        {
-            *(int*)fieldValue = trackedCounts.formattingChanges;
-            return ft_numeric_32;
-        }
-
-        default:
-            return ft_nomorefields;
+    __declspec(dllexport) void __stdcall ContentSetDefaultParams(void* dparm)
+    {
+        if (!dparm) return;
+        wchar_t* pIniPath = SafeGetIniPath(dparm);
+        
+        if (pIniPath) {
         }
     }
 
+    __declspec(dllexport) void __stdcall ContentStopGetValue(void)
+    {
+        g_cancelRequested.store(true, std::memory_order_relaxed);
+        ClearCache();
+    }
+
+    __declspec(dllexport) void __stdcall ContentStopGetValueW(void)
+    {
+        ContentStopGetValue();
+    }
+
+    __declspec(dllexport) int __stdcall ContentGetSupportedFieldFlags(int fieldIndex)
+    {
+        return 0;
+    }
+
+    __declspec(dllexport) void __stdcall ContentPluginUnloading(void)
+    {
+        // Stop any work and clear caches
+        g_cancelRequested.store(true, std::memory_order_relaxed);
+        ClearCache();
+    }
+    
 }
