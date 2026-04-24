@@ -1581,10 +1581,11 @@ extern "C" {
         case FIELD_CORE_DESCRIPTION:
         case FIELD_APP_HYPERLINK_BASE:
         case FIELD_CORE_CREATED_DATE:
-        case FIELD_CORE_LAST_MODIFIED_BY:
         case FIELD_CORE_MODIFIED_DATE:
         case FIELD_CORE_LAST_PRINTED_DATE:
+        case FIELD_CORE_LAST_MODIFIED_BY:
         case FIELD_CORE_REVISION_NUMBER:
+        case FIELD_APP_EDITING_TIME:
             return contflags_edit;
         default:
             return 0;
@@ -1638,17 +1639,7 @@ extern "C" {
 
             element = doc.NewElement(elementName);
             element->SetText(value.c_str());
-
-            tinyxml2::XMLElement* insertBefore = nullptr;
-            for (tinyxml2::XMLElement* child = root->FirstChildElement(); child; child = child->NextSiblingElement()) {
-                const char* name = child->Name();
-                if (name && (strncmp(name, "dcterms:", 8) == 0 || strncmp(name, "w:", 2) == 0)) {
-                    insertBefore = child;
-                    break;
-                }
-            }
-            if (insertBefore) root->InsertEndChild(element);
-            else root->InsertEndChild(element);
+            root->InsertEndChild(element);
         }
 
         tinyxml2::XMLPrinter printer;
@@ -1681,13 +1672,6 @@ extern "C" {
 
         g_cancelRequested.store(false, std::memory_order_relaxed);
 
-        std::string coreXml, appXml, settingsXml, documentXml, commentsXml;
-        ExtractFileFromZip(ansiPath.c_str(), "docProps/core.xml", coreXml);
-        ExtractFileFromZip(ansiPath.c_str(), "docProps/app.xml", appXml);
-        ExtractFileFromZip(ansiPath.c_str(), "word/settings.xml", settingsXml);
-        ExtractFileFromZip(ansiPath.c_str(), "word/document.xml", documentXml);
-        ExtractFileFromZip(ansiPath.c_str(), "word/comments.xml", commentsXml);
-
         auto FieldValueToUtf8 = [&](int fType, const void* fVal) -> std::string {
             if (!fVal) return std::string();
             if (fType == ft_string || fType == ft_stringw || fType == ft_fulltext || fType == ft_fulltextw) {
@@ -1705,6 +1689,10 @@ extern "C" {
             };
 
         switch (fieldIndex) {
+            // ----------------------------------------------------------------
+            // String fields: Title, Subject, Author, Keywords, Comments (core)
+            //                Manager, Company, Hyperlink base (app)
+            // ----------------------------------------------------------------
         case FIELD_CORE_TITLE:
         case FIELD_CORE_SUBJECT:
         case FIELD_CORE_CREATOR:
@@ -1713,11 +1701,9 @@ extern "C" {
         case FIELD_APP_MANAGER:
         case FIELD_APP_COMPANY:
         case FIELD_APP_HYPERLINK_BASE:
-        case FIELD_APP_TEMPLATE:
         {
             std::string value = FieldValueToUtf8(fieldType, fieldValue);
             std::string currentValue = GetFieldResult(ansiPath, fieldIndex, unitIndex).s;
-
             if (value == currentValue) return ft_setsuccess;
 
             bool isCore = (fieldIndex == FIELD_CORE_TITLE ||
@@ -1725,103 +1711,107 @@ extern "C" {
                 fieldIndex == FIELD_CORE_CREATOR ||
                 fieldIndex == FIELD_CORE_KEYWORDS ||
                 fieldIndex == FIELD_CORE_DESCRIPTION);
-            bool appUpdated = false, coreUpdated = false;
+
             if (isCore) {
                 std::string coreXml;
                 if (ExtractFileFromZip(ansiPath.c_str(), "docProps/core.xml", coreXml)) {
-                    if (SetXmlStringValue(coreXml, (fieldIndex == FIELD_CORE_TITLE ? "dc:title" :
+                    const char* elemName =
+                        fieldIndex == FIELD_CORE_TITLE ? "dc:title" :
                         fieldIndex == FIELD_CORE_SUBJECT ? "dc:subject" :
                         fieldIndex == FIELD_CORE_CREATOR ? "dc:creator" :
                         fieldIndex == FIELD_CORE_KEYWORDS ? "cp:keywords" :
-                        fieldIndex == FIELD_CORE_DESCRIPTION ? "dc:description" : ""),
-                        value)) {
+                        fieldIndex == FIELD_CORE_DESCRIPTION ? "dc:description" : "";
+                    if (SetXmlStringValue(coreXml, elemName, value)) {
                         SaveXmlToZip(ansiPath.c_str(), "docProps/core.xml", coreXml);
-                        coreUpdated = true;
+                        ClearCache();
                     }
                 }
             }
             else {
                 std::string appXml;
                 if (ExtractFileFromZip(ansiPath.c_str(), "docProps/app.xml", appXml)) {
-                    if (SetXmlStringValue(appXml, (fieldIndex == FIELD_APP_MANAGER ? "Manager" :
+                    const char* elemName =
+                        fieldIndex == FIELD_APP_MANAGER ? "Manager" :
                         fieldIndex == FIELD_APP_COMPANY ? "Company" :
-                        fieldIndex == FIELD_APP_HYPERLINK_BASE ? "HyperlinkBase" :
-                        fieldIndex == FIELD_APP_TEMPLATE ? "Template" : ""),
-                        value)) {
+                        fieldIndex == FIELD_APP_HYPERLINK_BASE ? "HyperlinkBase" : "";
+                    if (SetXmlStringValue(appXml, elemName, value)) {
                         SaveXmlToZip(ansiPath.c_str(), "docProps/app.xml", appXml);
-                        appUpdated = true;
-                    }
-                }
-            }
-
-            if (coreUpdated || appUpdated) {
-                ClearCache();
-            }
-        }
-        return ft_setsuccess;
-        case FIELD_CORE_CREATED_DATE:
-        case FIELD_CORE_MODIFIED_DATE:
-        case FIELD_CORE_LAST_PRINTED_DATE:
-        {
-            if (fieldType == ft_datetime && fieldValue) {
-                FILETIME ft;
-                memcpy(&ft, fieldValue, sizeof(FILETIME));
-                std::string newValue = FileTimeToIso8601UTC(&ft);
-                if (newValue.empty()) return ft_fieldempty;
-                bool updated = false;
-                std::string coreXmlLocal;
-                if (ExtractFileFromZip(ansiPath.c_str(), "docProps/core.xml", coreXmlLocal)) {
-                    if (fieldIndex == FIELD_CORE_CREATED_DATE) {
-                        if (SetXmlStringValue(coreXmlLocal, "dcterms:created", newValue)) updated = true;
-                    }
-                    else if (fieldIndex == FIELD_CORE_MODIFIED_DATE) {
-                        if (SetXmlStringValue(coreXmlLocal, "dcterms:modified", newValue)) updated = true;
-                    }
-                    else if (fieldIndex == FIELD_CORE_LAST_PRINTED_DATE) {
-                        if (SetXmlStringValue(coreXmlLocal, "cp:lastPrinted", newValue)) updated = true;
-                    }
-
-                    if (updated) {
-                        SaveXmlToZip(ansiPath.c_str(), "docProps/core.xml", coreXmlLocal);
                         ClearCache();
                     }
                 }
             }
-            else {
-                return ft_fieldempty;
+        }
+        return ft_setsuccess;
+
+        // ----------------------------------------------------------------
+        // Date/time fields: Created, Modified, Printed
+        // ----------------------------------------------------------------
+        case FIELD_CORE_CREATED_DATE:
+        case FIELD_CORE_MODIFIED_DATE:
+        case FIELD_CORE_LAST_PRINTED_DATE:
+        {
+            if (fieldType != ft_datetime || !fieldValue) return ft_fieldempty;
+            FILETIME ft;
+            memcpy(&ft, fieldValue, sizeof(FILETIME));
+            std::string newValue = FileTimeToIso8601UTC(&ft);
+            if (newValue.empty()) return ft_fieldempty;
+
+            std::string coreXml;
+            if (ExtractFileFromZip(ansiPath.c_str(), "docProps/core.xml", coreXml)) {
+                const char* elemName =
+                    fieldIndex == FIELD_CORE_CREATED_DATE ? "dcterms:created" :
+                    fieldIndex == FIELD_CORE_MODIFIED_DATE ? "dcterms:modified" :
+                    "cp:lastPrinted";
+                if (SetXmlStringValue(coreXml, elemName, newValue)) {
+                    SaveXmlToZip(ansiPath.c_str(), "docProps/core.xml", coreXml);
+                    ClearCache();
+                }
             }
         }
         return ft_setsuccess;
+
+        // ----------------------------------------------------------------
+        // Last saved by (core string)
+        // ----------------------------------------------------------------
         case FIELD_CORE_LAST_MODIFIED_BY:
         {
             std::string userName = FieldValueToUtf8(fieldType, fieldValue);
-            std::string coreXmlLocal;
-            if (ExtractFileFromZip(ansiPath.c_str(), "docProps/core.xml", coreXmlLocal)) {
-                if (SetXmlStringValue(coreXmlLocal, "cp:lastModifiedBy", userName)) {
-                    SaveXmlToZip(ansiPath.c_str(), "docProps/core.xml", coreXmlLocal);
+            std::string coreXml;
+            if (ExtractFileFromZip(ansiPath.c_str(), "docProps/core.xml", coreXml)) {
+                if (SetXmlStringValue(coreXml, "cp:lastModifiedBy", userName)) {
+                    SaveXmlToZip(ansiPath.c_str(), "docProps/core.xml", coreXml);
                     ClearCache();
                 }
             }
         }
         return ft_setsuccess;
+
+        // ----------------------------------------------------------------
+        // Revision number (core numeric)
+        // ----------------------------------------------------------------
         case FIELD_CORE_REVISION_NUMBER:
         {
+            if (!fieldValue) return ft_fieldempty;
             int revision = *(static_cast<const int*>(fieldValue));
-            std::string coreXmlLocal;
-            if (ExtractFileFromZip(ansiPath.c_str(), "docProps/core.xml", coreXmlLocal)) {
+            std::string coreXml;
+            if (ExtractFileFromZip(ansiPath.c_str(), "docProps/core.xml", coreXml)) {
                 char buf[16];
                 snprintf(buf, sizeof(buf), "%d", revision);
-                if (SetXmlStringValue(coreXmlLocal, "cp:revision", buf)) {
-                    SaveXmlToZip(ansiPath.c_str(), "docProps/core.xml", coreXmlLocal);
+                if (SetXmlStringValue(coreXml, "cp:revision", buf)) {
+                    SaveXmlToZip(ansiPath.c_str(), "docProps/core.xml", coreXml);
                     ClearCache();
                 }
             }
         }
         return ft_setsuccess;
+
+        // ----------------------------------------------------------------
+        // Total editing time (app numeric, minutes)
+        // ----------------------------------------------------------------
         case FIELD_APP_EDITING_TIME:
         {
+            if (!fieldValue) return ft_fieldempty;
             int editingTime = *(static_cast<const int*>(fieldValue));
-
             std::string appXml;
             if (ExtractFileFromZip(ansiPath.c_str(), "docProps/app.xml", appXml)) {
                 char buf[16];
@@ -1833,298 +1823,7 @@ extern "C" {
             }
         }
         return ft_setsuccess;
-        case FIELD_APP_PAGES:
-        {
-            int pages = *(static_cast<const int*>(fieldValue));
 
-            std::string appXml;
-            if (ExtractFileFromZip(ansiPath.c_str(), "docProps/app.xml", appXml)) {
-                char buf[16];
-                snprintf(buf, sizeof(buf), "%d", pages);
-                if (SetXmlStringValue(appXml, "Pages", buf)) {
-                    SaveXmlToZip(ansiPath.c_str(), "docProps/app.xml", appXml);
-                    ClearCache();
-                }
-            }
-        }
-        return ft_setsuccess;
-        case FIELD_APP_PARAGRAPHS:
-        {
-            int paragraphs = *(static_cast<const int*>(fieldValue));
-
-            std::string appXml;
-            if (ExtractFileFromZip(ansiPath.c_str(), "docProps/app.xml", appXml)) {
-                char buf[16];
-                snprintf(buf, sizeof(buf), "%d", paragraphs);
-                if (SetXmlStringValue(appXml, "Paragraphs", buf)) {
-                    SaveXmlToZip(ansiPath.c_str(), "docProps/app.xml", appXml);
-                    ClearCache();
-                }
-            }
-        }
-        return ft_setsuccess;
-        case FIELD_APP_LINES:
-        {
-            int lines = *(static_cast<const int*>(fieldValue));
-
-            std::string appXml;
-            if (ExtractFileFromZip(ansiPath.c_str(), "docProps/app.xml", appXml)) {
-                char buf[16];
-                snprintf(buf, sizeof(buf), "%d", lines);
-                if (SetXmlStringValue(appXml, "Lines", buf)) {
-                    SaveXmlToZip(ansiPath.c_str(), "docProps/app.xml", appXml);
-                    ClearCache();
-                }
-            }
-        }
-        return ft_setsuccess;
-        case FIELD_APP_WORDS:
-        {
-            int words = *(static_cast<const int*>(fieldValue));
-
-            std::string appXml;
-            if (ExtractFileFromZip(ansiPath.c_str(), "docProps/app.xml", appXml)) {
-                char buf[16];
-                snprintf(buf, sizeof(buf), "%d", words);
-                if (SetXmlStringValue(appXml, "Words", buf)) {
-                    SaveXmlToZip(ansiPath.c_str(), "docProps/app.xml", appXml);
-                    ClearCache();
-                }
-            }
-        }
-        return ft_setsuccess;
-        case FIELD_APP_CHARACTERS:
-        {
-            int characters = *(static_cast<const int*>(fieldValue));
-
-            std::string appXml;
-            if (ExtractFileFromZip(ansiPath.c_str(), "docProps/app.xml", appXml)) {
-                char buf[16];
-                snprintf(buf, sizeof(buf), "%d", characters);
-                if (SetXmlStringValue(appXml, "Characters", buf)) {
-                    SaveXmlToZip(ansiPath.c_str(), "docProps/app.xml", appXml);
-                    ClearCache();
-                }
-            }
-        }
-        return ft_numeric_32;
-        case FIELD_COMPATMODE:
-        {
-            bool enabled = (*(static_cast<const int*>(fieldValue)) != 0);
-
-            tinyxml2::XMLDocument doc;
-            if (doc.Parse(settingsXml.c_str()) == tinyxml2::XML_SUCCESS) {
-                tinyxml2::XMLElement* root = doc.FirstChildElement("w:settings");
-                if (root) {
-                    tinyxml2::XMLElement* compat = root->FirstChildElement("w:compat");
-                    if (!compat) {
-                        compat = doc.NewElement("w:compat");
-                        root->InsertEndChild(compat);
-                    }
-
-                    tinyxml2::XMLElement* compatSetting = compat->FirstChildElement("w:compatSetting");
-                    bool modeFound = false;
-                    while (compatSetting) {
-                        const char* nameAttr = compatSetting->Attribute("w:name");
-                        if (nameAttr && strcmp(nameAttr, "compatibilityMode") == 0) {
-                            modeFound = true;
-                            if (enabled) {
-                                compatSetting->SetAttribute("w:val", "14"); // Set to Word 2010 compatibility
-                            }
-                            else {
-                                compatSetting->DeleteAttribute("w:val");
-                            }
-                            break;
-                        }
-                        compatSetting = compatSetting->NextSiblingElement("w:compatSetting");
-                    }
-                    if (!modeFound && enabled) {
-                        tinyxml2::XMLElement* newSetting = doc.NewElement("w:compatSetting");
-                        newSetting->SetAttribute("w:name", "compatibilityMode");
-                        newSetting->SetAttribute("w:val", "14");
-                        compat->InsertEndChild(newSetting);
-                    }
-
-                    tinyxml2::XMLPrinter printer;
-                    doc.Accept(&printer);
-                    std::string updatedSettingsXml = printer.CStr();
-                    SaveXmlToZip(ansiPath.c_str(), "word/settings.xml", updatedSettingsXml);
-                    ClearCache();
-                }
-            }
-        }
-        return ft_setsuccess;
-        case FIELD_HIDDEN_TEXT:
-        {
-            bool enabled = (*(static_cast<const int*>(fieldValue)) != 0);
-
-            std::string documentXml;
-            if (ExtractFileFromZip(ansiPath.c_str(), "word/document.xml", documentXml)) {
-                tinyxml2::XMLDocument doc;
-                if (doc.Parse(documentXml.c_str()) == tinyxml2::XML_SUCCESS) {
-                    tinyxml2::XMLElement* body = doc.FirstChildElement("w:document")->FirstChildElement("w:body");
-                    if (body) {
-                        for (tinyxml2::XMLElement* para = body->FirstChildElement("w:p"); para != nullptr; para = para->NextSiblingElement("w:p")) {
-                            for (tinyxml2::XMLElement* run = para->FirstChildElement("w:r"); run != nullptr; run = run->NextSiblingElement("w:r")) {
-                                tinyxml2::XMLElement* rPr = run->FirstChildElement("w:rPr");
-                                if (!rPr) continue;
-
-                                if (enabled) {
-                                    rPr->SetAttribute("w:vanish", "true");
-                                }
-                                else {
-                                    rPr->DeleteAttribute("w:vanish");
-                                }
-                            }
-
-                            tinyxml2::XMLPrinter printer;
-                            doc.Accept(&printer);
-                            std::string updatedDocumentXml = printer.CStr();
-                            SaveXmlToZip(ansiPath.c_str(), "word/document.xml", updatedDocumentXml);
-                            ClearCache();
-                        }
-                    }
-                }
-            }
-        }
-        return ft_setsuccess;
-        case FIELD_COMMENTS:
-        {
-            return ft_setsuccess;
-        }
-        case FIELD_DOCUMENT_PROTECTION:
-        {
-            std::string protectionSetting;
-            if (fieldType == ft_stringw) {
-                protectionSetting = FieldValueToUtf8(fieldType, fieldValue);
-            }
-            else if (fieldType == ft_string) {
-                protectionSetting = std::string(static_cast<const char*>(fieldValue));
-            }
-
-            tinyxml2::XMLDocument doc;
-            if (doc.Parse(settingsXml.c_str()) == tinyxml2::XML_SUCCESS) {
-                tinyxml2::XMLElement* root = doc.FirstChildElement("w:settings");
-                if (root) {
-                    tinyxml2::XMLElement* protectionElem = root->FirstChildElement("w:documentProtection");
-                    if (!protectionElem) {
-                        protectionElem = doc.NewElement("w:documentProtection");
-                        root->InsertEndChild(protectionElem);
-                    }
-
-                    protectionElem->SetAttribute("w:enforcement", "0");
-                    protectionElem->DeleteAttribute("w:edit");
-                    protectionElem->DeleteAttribute("w:proofState");
-                    protectionElem->DeleteAttribute("w:cryptProvider");
-                    protectionElem->DeleteAttribute("w:cryptAlgorithmClass");
-                    protectionElem->DeleteAttribute("w:cryptAlgorithmType");
-                    protectionElem->DeleteAttribute("w:cryptKeyLength");
-                    protectionElem->DeleteAttribute("w:hashAlgorithm");
-                    protectionElem->DeleteAttribute("w:salt");
-                    protectionElem->DeleteAttribute("w:spinCount");
-
-                    if (protectionSetting == "Read-Only") {
-                        protectionElem->SetAttribute("w:enforcement", "1");
-                        protectionElem->SetAttribute("w:edit", "readOnly");
-                    }
-                    else if (protectionSetting == "Forms") {
-                        protectionElem->SetAttribute("w:enforcement", "1");
-                        protectionElem->SetAttribute("w:edit", "forms");
-                    }
-                    else if (protectionSetting == "Comments") {
-                        protectionElem->SetAttribute("w:enforcement", "1");
-                        protectionElem->SetAttribute("w:edit", "comments");
-                    }
-                    else if (protectionSetting == "Tracked Changes") {
-                        protectionElem->SetAttribute("w:enforcement", "1");
-                        protectionElem->SetAttribute("w:edit", "trackedChanges");
-                    }
-
-                    tinyxml2::XMLPrinter printer;
-                    doc.Accept(&printer);
-                    std::string updatedSettingsXml = printer.CStr();
-                    SaveXmlToZip(ansiPath.c_str(), "word/settings.xml", updatedSettingsXml);
-                    ClearCache();
-                }
-            }
-        }
-        return ft_string;
-        case FIELD_AUTO_UPDATE_STYLES:
-        {
-            bool enabled = (*(static_cast<const int*>(fieldValue)) != 0);
-
-            tinyxml2::XMLDocument doc;
-            if (doc.Parse(settingsXml.c_str()) == tinyxml2::XML_SUCCESS) {
-                tinyxml2::XMLElement* root = doc.FirstChildElement("w:settings");
-                if (root) {
-                    tinyxml2::XMLElement* autoUpdateElem = root->FirstChildElement("w:autoUpdateStyles");
-                    if (!autoUpdateElem) {
-                        autoUpdateElem = doc.NewElement("w:autoUpdateStyles");
-                        root->InsertEndChild(autoUpdateElem);
-                    }
-
-                    if (enabled) {
-                        autoUpdateElem->SetAttribute("w:val", "1");
-                    }
-                    else {
-                        autoUpdateElem->SetAttribute("w:val", "0");
-                    }
-
-                    tinyxml2::XMLPrinter printer;
-                    doc.Accept(&printer);
-                    std::string updatedSettingsXml = printer.CStr();
-                    SaveXmlToZip(ansiPath.c_str(), "word/settings.xml", updatedSettingsXml);
-                    ClearCache();
-                }
-            }
-        }
-        return ft_setsuccess;
-        case FIELD_ANONYMISED_FILES:
-        {
-            int flags = *(static_cast<const int*>(fieldValue));
-
-            tinyxml2::XMLDocument doc;
-            if (doc.Parse(settingsXml.c_str()) == tinyxml2::XML_SUCCESS) {
-                tinyxml2::XMLElement* root = doc.FirstChildElement("w:settings");
-                if (root) {
-                    tinyxml2::XMLElement* removePIElem = root->FirstChildElement("w:removePersonalInformation");
-                    tinyxml2::XMLElement* removeDateElem = root->FirstChildElement("w:removeDateAndTime");
-
-                    if (flags & 1) {
-                        if (!removePIElem) {
-                            removePIElem = doc.NewElement("w:removePersonalInformation");
-                            root->InsertEndChild(removePIElem);
-                        }
-                        removePIElem->SetAttribute("w:val", "1");
-                    }
-                    else {
-                        if (removePIElem) {
-                            root->DeleteChild(removePIElem);
-                        }
-                    }
-
-                    if (flags & 2) {
-                        if (!removeDateElem) {
-                            removeDateElem = doc.NewElement("w:removeDateAndTime");
-                            root->InsertEndChild(removeDateElem);
-                        }
-                        removeDateElem->SetAttribute("w:val", "1");
-                    }
-                    else {
-                        if (removeDateElem) {
-                            root->DeleteChild(removeDateElem);
-                        }
-                    }
-
-                    tinyxml2::XMLPrinter printer;
-                    doc.Accept(&printer);
-                    std::string updatedSettingsXml = printer.CStr();
-                    SaveXmlToZip(ansiPath.c_str(), "word/settings.xml", updatedSettingsXml);
-                    ClearCache();
-                }
-            }
-        }
-        return ft_setsuccess;
         default:
             return ft_notsupported;
         }
@@ -2147,12 +1846,12 @@ extern "C" __declspec(dllexport) int __stdcall ContentSetValue(
     std::wstring widebuf;
 
     if (fieldValue) {
-        if (fieldIndex == FIELD_CORE_REVISION_NUMBER || fieldIndex == FIELD_APP_EDITING_TIME ||
-            fieldIndex == FIELD_APP_PAGES || fieldIndex == FIELD_APP_PARAGRAPHS || fieldIndex == FIELD_APP_LINES ||
-            fieldIndex == FIELD_APP_WORDS || fieldIndex == FIELD_APP_CHARACTERS ||
-            fieldIndex == FIELD_CORE_CREATED_DATE || fieldIndex == FIELD_CORE_MODIFIED_DATE || fieldIndex == FIELD_CORE_LAST_PRINTED_DATE ||
-            fieldIndex == FIELD_COMPATMODE || fieldIndex == FIELD_HIDDEN_TEXT || fieldIndex == FIELD_TRACKED_CHANGES ||
-            fieldIndex == FIELD_AUTO_UPDATE_STYLES || fieldIndex == FIELD_ANONYMISED_FILES || fieldIndex == FIELD_CORE_REVISION_NUMBER)
+        // Numeric and date fields are passed through as raw bytes; string fields are converted to wide
+        if (fieldIndex == FIELD_CORE_REVISION_NUMBER ||
+            fieldIndex == FIELD_APP_EDITING_TIME ||
+            fieldIndex == FIELD_CORE_CREATED_DATE ||
+            fieldIndex == FIELD_CORE_MODIFIED_DATE ||
+            fieldIndex == FIELD_CORE_LAST_PRINTED_DATE)
         {
             passValue = fieldValue;
         }
@@ -2199,28 +1898,17 @@ extern "C" __declspec(dllexport) int __stdcall ContentSetValue(
         }
     }
 
-    int fType = ft_string;
+    int fType = ft_stringw;
     switch (fieldIndex) {
     case FIELD_CORE_REVISION_NUMBER:
     case FIELD_APP_EDITING_TIME:
-    case FIELD_APP_PAGES:
-    case FIELD_APP_PARAGRAPHS:
-    case FIELD_APP_LINES:
-    case FIELD_APP_WORDS:
-    case FIELD_APP_CHARACTERS:
         fType = ft_numeric_32; break;
     case FIELD_CORE_CREATED_DATE:
     case FIELD_CORE_MODIFIED_DATE:
     case FIELD_CORE_LAST_PRINTED_DATE:
         fType = ft_datetime; break;
-    case FIELD_COMPATMODE:
-    case FIELD_HIDDEN_TEXT:
-    case FIELD_TRACKED_CHANGES:
-    case FIELD_AUTO_UPDATE_STYLES:
-    case FIELD_ANONYMISED_FILES:
-        fType = ft_boolean; break;
     default:
-        fType = ft_string; break;
+        fType = ft_stringw; break;
     }
 
     return ContentSetValueW(&wfn[0], fieldIndex, unitIndex, fType, const_cast<void*>(passValue), flags);
