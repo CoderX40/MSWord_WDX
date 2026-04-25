@@ -20,6 +20,7 @@
 #pragma comment(linker, "/export:ContentGetSupportedField=_ContentGetSupportedField@16")
 #pragma comment(linker, "/export:ContentGetValue=_ContentGetValue@24")
 #pragma comment(linker, "/export:ContentGetValueW=_ContentGetValueW@24")
+#pragma comment(linker, "/export:ContentGetSupportedFieldFlags=_ContentGetSupportedFieldFlags@4")
 #pragma comment(linker, "/export:ContentSetValue=_ContentSetValue@24")
 #pragma comment(linker, "/export:ContentSetValueW=_ContentSetValueW@24")
 #endif
