@@ -11,6 +11,8 @@
 #include <iomanip>
 #include <ctime>
 #include <cstdio>
+#include <cstdarg>
+#include <cctype>
 #include <vector>
 #include <map>
 #include "miniz.h"
@@ -23,6 +25,8 @@
 #pragma comment(linker, "/export:ContentGetSupportedFieldFlags=_ContentGetSupportedFieldFlags@4")
 #pragma comment(linker, "/export:ContentSetValue=_ContentSetValue@24")
 #pragma comment(linker, "/export:ContentSetValueW=_ContentSetValueW@24")
+#pragma comment(linker, "/export:ContentEditValue=_ContentEditValue@32")
+#pragma comment(linker, "/export:ContentEditValueW=_ContentEditValueW@32")
 #endif
 
 // Constants for Total Commander field types
@@ -45,6 +49,8 @@
 #define ft_ondemand         -4
 #define ft_notsupported     -5
 #define ft_setsuccess       0
+#define ft_setcancel        -2
+#define ft_seterror         -1
 
 // Constants for ContentGetSupportedFieldFlags
 #define contflags_edit 1
@@ -283,6 +289,16 @@ bool Utf8ToWideString(const std::string& in, std::wstring& out)
     return true;
 }
 
+std::string WideToUtf8(const std::wstring& wstr) {
+    if (wstr.empty()) return std::string();
+    int needed = WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), -1, NULL, 0, NULL, NULL);
+    if (needed <= 0) return std::string();
+    std::string out;
+    out.resize(needed - 1);
+    WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), -1, &out[0], needed, NULL, NULL);
+    return out;
+}
+
 bool FormatSystemTimeToString(const FILETIME& ft_utc, int unitIndex, wchar_t* outputWStr, int maxWLen);
 
 bool FormatSystemTimeToAnsi(const FILETIME& ft_utc, int unitIndex, char* outputStr, int maxLen) {
@@ -487,6 +503,19 @@ int CountComments(const std::string& xmlContent)
     return count;
 }
 
+static bool IsOnOffElementEnabled(tinyxml2::XMLElement* element)
+{
+    if (!element) return false;
+    const char* val = element->Attribute("w:val");
+    if (!val) return true;
+
+    std::string s(val);
+    for (char& ch : s)
+        ch = static_cast<char>(tolower(static_cast<unsigned char>(ch)));
+
+    return !(s == "0" || s == "false" || s == "off");
+}
+
 bool IsTrackChangesEnabled(const std::string& settingsXmlContent) {
     tinyxml2::XMLDocument doc;
     if (doc.Parse(settingsXmlContent.c_str()) != tinyxml2::XML_SUCCESS) {
@@ -496,14 +525,7 @@ bool IsTrackChangesEnabled(const std::string& settingsXmlContent) {
     tinyxml2::XMLElement* root = doc.RootElement();
     if (!root) return false;
 
-    for (tinyxml2::XMLElement* child = root->FirstChildElement(); child != nullptr; child = child->NextSiblingElement()) {
-        const char* tag = child->Value();
-        if (tag && std::string(tag).find("trackRevisions") != std::string::npos) {
-            return true;
-        }
-    }
-
-    return false;
+    return IsOnOffElementEnabled(root->FirstChildElement("w:trackRevisions"));
 }
 
 bool IsAutoUpdateStylesEnabled(const std::string& settingsXmlContent) {
@@ -515,14 +537,7 @@ bool IsAutoUpdateStylesEnabled(const std::string& settingsXmlContent) {
     tinyxml2::XMLElement* root = doc.RootElement();
     if (!root) return false;
 
-    for (tinyxml2::XMLElement* child = root->FirstChildElement(); child != nullptr; child = child->NextSiblingElement()) {
-        const char* tag = child->Value();
-        if (tag && std::string(tag).find("linkStyles") != std::string::npos) {
-            return true;
-        }
-    }
-
-    return false;
+    return IsOnOffElementEnabled(root->FirstChildElement("w:linkStyles"));
 }
 
 int GetAnonymisedFlags(const std::string& settingsXmlContent) {
@@ -536,21 +551,8 @@ int GetAnonymisedFlags(const std::string& settingsXmlContent) {
     tinyxml2::XMLElement* root = doc.RootElement();
     if (!root) return 0;
 
-    bool hasPI = false;
-    bool hasDate = false;
-
-    for (tinyxml2::XMLElement* child = root->FirstChildElement(); child != nullptr; child = child->NextSiblingElement()) {
-        const char* tag = child->Value();
-        if (!tag) continue;
-        std::string t(tag);
-        if (t.find("removePersonalInformation") != std::string::npos) {
-            hasPI = true;
-        }
-        if (t.find("removeDateAndTime") != std::string::npos) {
-            hasDate = true;
-        }
-        if (hasPI && hasDate) break;
-    }
+    bool hasPI = IsOnOffElementEnabled(root->FirstChildElement("w:removePersonalInformation"));
+    bool hasDate = IsOnOffElementEnabled(root->FirstChildElement("w:removeDateAndTime"));
 
     int flags = 0;
     if (hasPI) flags |= 1;
@@ -815,6 +817,66 @@ bool FormatSystemTimeToString(const FILETIME& ft_utc, int unitIndex, wchar_t* ou
     return true;
 }
 
+bool ReplaceFileInZip(const char* zipPath, const char* entryName, const std::string& data)
+{
+    mz_zip_archive zip = {};
+
+    if (!mz_zip_reader_init_file(&zip, zipPath, 0))
+        return false;
+
+    mz_zip_archive newZip = {};
+    if (!mz_zip_writer_init_heap(&newZip, 0, 0))
+        return false;
+
+    int fileCount = (int)mz_zip_reader_get_num_files(&zip);
+
+    for (int i = 0; i < fileCount; i++) {
+        mz_zip_archive_file_stat fileStat;
+        mz_zip_reader_file_stat(&zip, i, &fileStat);
+
+        if (strcmp(fileStat.m_filename, entryName) == 0) {
+            mz_zip_writer_add_mem(&newZip, entryName, data.c_str(), data.size(), MZ_DEFAULT_COMPRESSION);
+        }
+        else {
+            size_t size = 0;
+            void* buf = mz_zip_reader_extract_to_heap(&zip, i, &size, 0);
+            mz_zip_writer_add_mem(&newZip, fileStat.m_filename, buf, size, MZ_DEFAULT_COMPRESSION);
+            mz_free(buf);
+        }
+    }
+
+    mz_zip_reader_end(&zip);
+
+    size_t newSize = 0;
+    void* newBuf = nullptr;
+
+    if (!mz_zip_writer_finalize_heap_archive(&newZip, &newBuf, &newSize)) {
+        mz_zip_writer_end(&newZip);
+        return false;
+    }
+
+    mz_zip_writer_end(&newZip);
+
+    FILE* f = nullptr;
+    errno_t err = fopen_s(&f, zipPath, "wb");
+
+    if (err != 0 || !f) {
+        mz_free(newBuf);
+        return false;
+    }
+
+    size_t written = fwrite(newBuf, 1, newSize, f);
+    fclose(f);
+
+    mz_free(newBuf);
+
+    if (written != newSize) {
+        return false;
+    }
+
+    return true;
+}
+
 struct TrackedChangeCounts {
     int insertions = 0;
     int deletions = 0;
@@ -984,10 +1046,10 @@ FieldResult GetFieldResult(const std::string& ansiPath, int fieldIndex, int unit
     case FIELD_COMMENTS:
         needsCommentsXml = true; break;
     case FIELD_DOCUMENT_PROTECTION:
-        needsSettingsXml = true; break;
     case FIELD_AUTO_UPDATE_STYLES:
     case FIELD_ANONYMISED_FILES:
     case FIELD_TCS_ON_OFF:
+        needsSettingsXml = true; break;
     case FIELD_HIDDEN_TEXT:
     case FIELD_TRACKED_CHANGES:
     case FIELD_TOTAL_REVISIONS:
@@ -1126,23 +1188,16 @@ FieldResult GetFieldResult(const std::string& ansiPath, int fieldIndex, int unit
         res.s = protectionType; res.type = FieldResult::StringUtf8; break;
     }
     case FIELD_AUTO_UPDATE_STYLES:
-        res.b = IsAutoUpdateStylesEnabled(settingsXml); res.type = FieldResult::Boolean; break;
+        res.i32 = IsAutoUpdateStylesEnabled(settingsXml) ? 0 : 1;
+        res.type = FieldResult::Int32; break;
     case FIELD_ANONYMISED_FILES:
-    {
-        int flags = GetAnonymisedFlags(settingsXml);
-        switch (flags) {
-        case 0: res.s = "No"; break;
-        case 1: res.s = "Personal Information"; break;
-        case 2: res.s = "Date and Time"; break;
-        case 3: res.s = "Personal Information, Date and Time"; break;
-        default: res.s = "No"; break;
-        }
-        res.type = FieldResult::StringUtf8; break;
-    }
+        res.i32 = GetAnonymisedFlags(settingsXml);
+        res.type = FieldResult::Int32; break;
     case FIELD_TRACKED_CHANGES:
         res.b = HasTrackedChanges(ansiPath.c_str()); res.type = FieldResult::Boolean; break;
     case FIELD_TCS_ON_OFF:
-        res.s = IsTrackChangesEnabled(settingsXml) ? "Activated" : "Deactivated"; res.type = FieldResult::StringUtf8; break;
+        res.i32 = IsTrackChangesEnabled(settingsXml) ? 0 : 1;
+        res.type = FieldResult::Int32; break;
     case FIELD_AUTHORS:
     {
         auto authors = GetTrackedChangeAuthorsFromAllXml(ansiPath.c_str());
@@ -1165,6 +1220,99 @@ FieldResult GetFieldResult(const std::string& ansiPath, int fieldIndex, int unit
 
 
 // --- Total Commander Content Plugin API ---
+
+// Debug logging — writes to %TEMP%\wdx_debug.log
+static void DbgLog(const char* fmt, ...)
+{
+    char tmpPath[MAX_PATH];
+    if (!GetTempPathA(MAX_PATH, tmpPath)) return;
+    std::string logPath = std::string(tmpPath) + "wdx_debug.log";
+    FILE* f = nullptr;
+    fopen_s(&f, logPath.c_str(), "a");
+    if (!f) return;
+    va_list args; va_start(args, fmt);
+    vfprintf(f, fmt, args);
+    va_end(args);
+    fclose(f);
+}
+
+static int GetChoiceIndex(const void* fieldValue)
+{
+    // TC may pass a small integer token instead of a pointer for ft_multiplechoice.
+    if (fieldValue == nullptr || reinterpret_cast<uintptr_t>(fieldValue) < 0xFFFF) {
+        if (fieldValue == nullptr) return -1;
+        return static_cast<int>(reinterpret_cast<uintptr_t>(fieldValue));
+    }
+
+    return -1;
+}
+
+static int MapChoiceTextToIndex(int fieldIndex, const char* text)
+{
+    if (!text || !*text) return -1;
+
+    if (fieldIndex == FIELD_AUTO_UPDATE_STYLES) {
+        if (strcmp(text, "Yes") == 0) return 0;
+        if (strcmp(text, "No") == 0) return 1;
+    }
+    else if (fieldIndex == FIELD_TCS_ON_OFF) {
+        if (strcmp(text, "Activated") == 0) return 0;
+        if (strcmp(text, "Deactivated") == 0) return 1;
+    }
+    else if (fieldIndex == FIELD_ANONYMISED_FILES) {
+        if (strcmp(text, "No") == 0) return 0;
+        if (strcmp(text, "Personal Information") == 0) return 1;
+        if (strcmp(text, "Date and Time") == 0) return 2;
+        if (strcmp(text, "Personal Information and Date and Time") == 0) return 3;
+    }
+
+    return -1;
+}
+
+static const char* GetIndirectAnsiChoiceText(const void* fieldValue)
+{
+    if (!fieldValue || reinterpret_cast<uintptr_t>(fieldValue) < 0xFFFF)
+        return nullptr;
+
+    const char* direct = static_cast<const char*>(fieldValue);
+    if (direct[0] != '\0') {
+        if (strcmp(direct, "Yes") == 0 || strcmp(direct, "No") == 0 ||
+            strcmp(direct, "Activated") == 0 || strcmp(direct, "Deactivated") == 0 ||
+            strcmp(direct, "Personal Information") == 0 || strcmp(direct, "Date and Time") == 0 ||
+            strcmp(direct, "Personal Information and Date and Time") == 0) {
+            return direct;
+        }
+    }
+
+    const char* const* indirect = static_cast<const char* const*>(fieldValue);
+    if (!indirect) return nullptr;
+
+    const char* nested = *indirect;
+    if (!nested || reinterpret_cast<uintptr_t>(nested) < 0xFFFF)
+        return nullptr;
+
+    return nested;
+}
+
+static int NormalizeChoiceIndex(int fieldIndex, const void* fieldValue, int choiceCount)
+{
+    const char* choiceText = GetIndirectAnsiChoiceText(fieldValue);
+    if (choiceText) {
+        int mapped = MapChoiceTextToIndex(fieldIndex, choiceText);
+        if (mapped >= 0)
+            return mapped;
+    }
+
+    int rawIndex = GetChoiceIndex(fieldValue);
+    if (rawIndex < 0 || choiceCount <= 0)
+        return -1;
+
+    if (rawIndex >= 0 && rawIndex < choiceCount)
+        return rawIndex;
+    if (rawIndex >= 1 && rawIndex <= choiceCount)
+        return rawIndex - 1;
+    return -1;
+}
 
 extern "C" {
 
@@ -1272,19 +1420,19 @@ extern "C" {
         case FIELD_DOCUMENT_PROTECTION:
             strncpy_s(fieldName, maxLen, "Document Protection", _TRUNCATE);
             strncpy_s(units, maxLen, "", _TRUNCATE);
-            return ft_string;
+            return ft_stringw;
         case FIELD_AUTO_UPDATE_STYLES:
             strncpy_s(fieldName, maxLen, "Auto Update Styles", _TRUNCATE);
-            strncpy_s(units, maxLen, "", _TRUNCATE);
-            return ft_boolean;
+            strncpy_s(units, maxLen, "Yes|No", _TRUNCATE);
+            return ft_multiplechoice;
         case FIELD_ANONYMISED_FILES:
             strncpy_s(fieldName, maxLen, "Files Anonymised", _TRUNCATE);
-            strncpy_s(units, maxLen, "", _TRUNCATE);
-            return ft_string;
+            strncpy_s(units, maxLen, "No|Personal Information|Date and Time|Personal Information and Date and Time", _TRUNCATE);
+            return ft_multiplechoice;
         case FIELD_TCS_ON_OFF:
             strncpy_s(fieldName, maxLen, "Track Changes", _TRUNCATE);
-            strncpy_s(units, maxLen, "", _TRUNCATE);
-            return ft_boolean;
+            strncpy_s(units, maxLen, "Activated|Deactivated", _TRUNCATE);
+            return ft_multiplechoice;
         case FIELD_TRACKED_CHANGES:
             strncpy_s(fieldName, maxLen, "Tracked Changes Present in Document", _TRUNCATE);
             strncpy_s(units, maxLen, "", _TRUNCATE);
@@ -1292,7 +1440,7 @@ extern "C" {
         case FIELD_AUTHORS:
             strncpy_s(fieldName, maxLen, "Tracked Changes Authors", _TRUNCATE);
             strncpy_s(units, maxLen, "", _TRUNCATE);
-            return ft_string;
+            return ft_stringw;
         case FIELD_TOTAL_REVISIONS:
             strncpy_s(fieldName, maxLen, "Total Revisions", _TRUNCATE);
             strncpy_s(units, maxLen, "", _TRUNCATE);
@@ -1318,6 +1466,7 @@ extern "C" {
             return ft_nomorefields;
         }
     }
+
 
     static bool SaveReplacementsToDocx(const std::string& path, const std::map<std::string, std::string>& replacements)
     {
@@ -1396,12 +1545,6 @@ extern "C" {
         }
 
 
-        for (const auto& kv : replacements) {
-            const std::string& name = kv.first;
-            size_t orig_size = 0;
-            void* p = mz_zip_reader_extract_file_to_heap(&tmp_reader, name.c_str(), &orig_size, 0);
-        }
-
         if (!MoveFileExA(tmpPath.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED)) {
             return false;
         }
@@ -1419,6 +1562,15 @@ extern "C" {
 
         g_cancelRequested.store(false, std::memory_order_relaxed);
 
+        auto WideToUtf8 = [](const std::wstring& w) -> std::string {
+            if (w.empty()) return std::string();
+            int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, nullptr, 0, nullptr, nullptr);
+            if (n <= 0) return std::string();
+            std::string s(n - 1, '\0');
+            WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, &s[0], n, nullptr, nullptr);
+            return s;
+            };
+
         std::string coreXml, appXml, settingsXml, documentXml, commentsXml;
         ExtractFileFromZip(ansiPath.c_str(), "docProps/core.xml", coreXml);
         ExtractFileFromZip(ansiPath.c_str(), "docProps/app.xml", appXml);
@@ -1433,13 +1585,36 @@ extern "C" {
             if (unitIndex == 0) { memcpy(fieldValue, &r.ft, sizeof(FILETIME)); return ft_datetime; }
             if (FormatSystemTimeToString(r.ft, unitIndex, static_cast<wchar_t*>(fieldValue), maxLen / sizeof(wchar_t))) return ft_stringw;
             return ft_fieldempty;
-        case FieldResult::Int32: *(int*)fieldValue = r.i32; return ft_numeric_32;
+        case FieldResult::Int32:
+            if (fieldIndex == FIELD_AUTO_UPDATE_STYLES ||
+                fieldIndex == FIELD_ANONYMISED_FILES ||
+                fieldIndex == FIELD_TCS_ON_OFF)
+            {
+                const char* choiceText = "";
+                if (fieldIndex == FIELD_AUTO_UPDATE_STYLES)
+                    choiceText = (r.i32 == 0) ? "Yes" : "No";
+                else if (fieldIndex == FIELD_TCS_ON_OFF)
+                    choiceText = (r.i32 == 0) ? "Activated" : "Deactivated";
+                else { // FIELD_ANONYMISED_FILES
+                    switch (r.i32) {
+                    case 1: choiceText = "Personal Information"; break;
+                    case 2: choiceText = "Date and Time"; break;
+                    case 3: choiceText = "Personal Information and Date and Time"; break;
+                    default: choiceText = "No"; break;
+                    }
+                }
+                strncpy_s(static_cast<char*>(fieldValue), static_cast<size_t>(maxLen), choiceText, _TRUNCATE);
+                return ft_multiplechoice;
+            }
+            *(int*)fieldValue = r.i32;
+            return ft_numeric_32;
         case FieldResult::Int64: *(long long*)fieldValue = r.i64; return ft_numeric_64;
         case FieldResult::Boolean: *((int*)fieldValue) = r.b ? 1 : 0; return ft_boolean;
         case FieldResult::StringUtf8:
         {
             if (r.s.empty()) { return ft_fieldempty; }
             if (!fieldValue || maxLen <= 0) return ft_fieldempty;
+
             std::wstring w;
             Utf8ToWideString(r.s, w);
             wcsncpy_s(static_cast<wchar_t*>(fieldValue), static_cast<size_t>(maxLen / sizeof(wchar_t)), w.c_str(), _TRUNCATE);
@@ -1466,7 +1641,29 @@ extern "C" {
             if (unitIndex == 0) { memcpy(fieldValue, &r.ft, sizeof(FILETIME)); return ft_datetime; }
             if (FormatSystemTimeToAnsi(r.ft, unitIndex, static_cast<char*>(fieldValue), maxLen)) return ft_string;
             return ft_fieldempty;
-        case FieldResult::Int32: *(int*)fieldValue = r.i32; return ft_numeric_32;
+        case FieldResult::Int32:
+            if (fieldIndex == FIELD_AUTO_UPDATE_STYLES ||
+                fieldIndex == FIELD_ANONYMISED_FILES ||
+                fieldIndex == FIELD_TCS_ON_OFF)
+            {
+                const char* choiceText = "";
+                if (fieldIndex == FIELD_AUTO_UPDATE_STYLES)
+                    choiceText = (r.i32 == 0) ? "Yes" : "No";
+                else if (fieldIndex == FIELD_TCS_ON_OFF)
+                    choiceText = (r.i32 == 0) ? "Activated" : "Deactivated";
+                else {
+                    switch (r.i32) {
+                    case 1: choiceText = "Personal Information"; break;
+                    case 2: choiceText = "Date and Time"; break;
+                    case 3: choiceText = "Personal Information and Date and Time"; break;
+                    default: choiceText = "No"; break;
+                    }
+                }
+                strncpy_s(static_cast<char*>(fieldValue), static_cast<size_t>(maxLen), choiceText, _TRUNCATE);
+                return ft_multiplechoice;
+            }
+            *(int*)fieldValue = r.i32;
+            return ft_numeric_32;
         case FieldResult::Int64: *(long long*)fieldValue = r.i64; return ft_numeric_64;
         case FieldResult::Boolean: *((int*)fieldValue) = r.b ? 1 : 0; return ft_boolean;
         case FieldResult::StringUtf8:
@@ -1483,7 +1680,7 @@ extern "C" {
                 int res = WideCharToMultiByte(CP_ACP, 0, w.c_str(), -1, static_cast<char*>(fieldValue), maxLen, NULL, NULL);
                 if (res == 0) return ft_fieldempty;
                 static_cast<char*>(fieldValue)[maxLen - 1] = '\0';
-                return ft_setsuccess;
+                return ft_string;
             }
         }
         return ft_fieldempty;
@@ -1568,8 +1765,9 @@ extern "C" {
 
     __declspec(dllexport) int __stdcall ContentGetSupportedFieldFlags(int fieldIndex)
     {
+        DbgLog("ContentGetSupportedFieldFlags called: fieldIndex=%d\n", fieldIndex);
         if (fieldIndex == -1) {
-            return contflags_edit;
+            return contflags_edit | contflags_fieldedit;
         }
 
         switch (fieldIndex) {
@@ -1587,7 +1785,13 @@ extern "C" {
         case FIELD_CORE_LAST_MODIFIED_BY:
         case FIELD_CORE_REVISION_NUMBER:
         case FIELD_APP_EDITING_TIME:
+        case FIELD_AUTO_UPDATE_STYLES:
+        case FIELD_ANONYMISED_FILES:
+        case FIELD_TCS_ON_OFF:
             return contflags_edit;
+        case FIELD_DOCUMENT_PROTECTION:
+        case FIELD_AUTHORS:
+            return contflags_edit | contflags_fieldedit;
         default:
             return 0;
         }
@@ -1643,7 +1847,7 @@ extern "C" {
             root->InsertEndChild(element);
         }
 
-        tinyxml2::XMLPrinter printer;
+        tinyxml2::XMLPrinter printer(nullptr, true);
         doc.Accept(&printer);
         std::string printed = printer.CStr();
 
@@ -1663,10 +1867,386 @@ extern "C" {
         return SaveReplacementsToDocx(std::string(zipPath), replacements);
     }
 
+    // ----------------------------------------------------------------
+    // Author rename helper: walks all word/*.xml files and renames
+    // w:author / w:originalAuthor attributes.
+    // oldAuthor empty = rename all authors.
+    // ----------------------------------------------------------------
+    static bool RenameTrackedChangeAuthors(const std::string& ansiPath,
+        const std::string& oldAuthor,
+        const std::string& newAuthor)
+    {
+        mz_zip_archive reader;
+        memset(&reader, 0, sizeof(reader));
+        if (!mz_zip_reader_init_file(&reader, ansiPath.c_str(), 0)) return false;
+
+        std::map<std::string, std::string> replacements;
+        mz_uint num_files = mz_zip_reader_get_num_files(&reader);
+        for (mz_uint i = 0; i < num_files; ++i) {
+            mz_zip_archive_file_stat stat;
+            if (!mz_zip_reader_file_stat(&reader, i, &stat)) continue;
+            const char* fname = stat.m_filename;
+            if (!fname) continue;
+            if (strncmp(fname, "word/", 5) != 0 || strstr(fname, ".xml") == nullptr) continue;
+
+            size_t sz = 0;
+            void* p = mz_zip_reader_extract_to_heap(&reader, i, &sz, 0);
+            if (!p) continue;
+            std::string xml(static_cast<char*>(p), sz);
+            mz_free(p);
+
+            tinyxml2::XMLDocument doc;
+            if (doc.Parse(xml.c_str()) != tinyxml2::XML_SUCCESS) continue;
+
+            bool modified = false;
+            std::function<void(tinyxml2::XMLElement*)> walk = [&](tinyxml2::XMLElement* elem) {
+                if (!elem) return;
+                for (const char* attr : { "w:author", "w:originalAuthor" }) {
+                    const char* val = elem->Attribute(attr);
+                    if (!val) continue;
+                    if (oldAuthor.empty() || oldAuthor == val) {
+                        elem->SetAttribute(attr, newAuthor.c_str());
+                        modified = true;
+                    }
+                }
+                for (auto* child = elem->FirstChildElement(); child; child = child->NextSiblingElement())
+                    walk(child);
+                };
+            walk(doc.RootElement());
+
+            if (modified) {
+                tinyxml2::XMLPrinter printer(nullptr, true);
+                doc.Accept(&printer);
+                replacements[std::string(fname)] = printer.CStr();
+            }
+        }
+        mz_zip_reader_end(&reader);
+        if (replacements.empty()) return true;
+        return SaveReplacementsToDocx(ansiPath, replacements);
+    }
+
+    // ----------------------------------------------------------------
+    // Author rename dialog (built in memory, no .rc file needed)
+    // ----------------------------------------------------------------
+    struct AuthorDlgData {
+        std::wstring oldAuthor;
+        std::wstring newAuthor;
+        bool accepted = false;
+    };
+
+#define ADL_OLD_EDIT 101
+#define ADL_NEW_EDIT 102
+
+    static INT_PTR CALLBACK AuthorDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam)
+    {
+        switch (msg) {
+        case WM_INITDIALOG:
+            SetWindowLongPtr(hDlg, GWLP_USERDATA, lParam);
+            SetWindowTextW(hDlg, L"Rename Tracked Change Author");
+            return TRUE;
+        case WM_COMMAND:
+            switch (LOWORD(wParam)) {
+            case IDOK:
+            {
+                AuthorDlgData* d = reinterpret_cast<AuthorDlgData*>(GetWindowLongPtr(hDlg, GWLP_USERDATA));
+                wchar_t oldName[512] = {};
+                wchar_t newName[512] = {};
+                GetWindowTextW(GetDlgItem(hDlg, ADL_OLD_EDIT), oldName, 512);
+                GetWindowTextW(GetDlgItem(hDlg, ADL_NEW_EDIT), newName, 512);
+
+                if (newName[0] == L'\0') {
+                    MessageBoxW(hDlg, L"Please enter a new name.", L"Error", MB_OK);
+                    return TRUE;
+                }
+
+                d->oldAuthor = oldName;
+                d->newAuthor = newName;
+                d->accepted = true;
+                EndDialog(hDlg, IDOK);
+                return TRUE;
+            }
+            case IDCANCEL:
+                EndDialog(hDlg, IDCANCEL);
+                return TRUE;
+            }
+            break;
+        case WM_CLOSE:
+            EndDialog(hDlg, IDCANCEL);
+            return TRUE;
+        }
+        return FALSE;
+    }
+
+    static DLGTEMPLATE* BuildAuthorDlgTemplate()
+    {
+        static WORD buf[2048];
+        memset(buf, 0, sizeof(buf));
+        WORD* p = buf;
+
+        auto W = [&](WORD w) { *p++ = w; };
+        auto DW = [&](DWORD dw) { memcpy(p, &dw, 4); p += 2; };
+        auto WS = [&](const wchar_t* s) { while (*s) *p++ = (WORD)*s++; *p++ = 0; };
+        auto Al = [&]() { if ((DWORD_PTR)p & 2) *p++ = 0; };
+
+        // 6 controls, 260x120 DLUs
+        DW(DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU);
+        DW(0); W(6); W(0); W(0); W(260); W(120);
+        W(0); W(0); WS(L"Rename Author"); W(8); WS(L"MS Shell Dlg");
+
+        auto Item = [&](DWORD style, short x, short y, short w, short h, WORD id,
+            const wchar_t* cls, const wchar_t* text) {
+                Al();
+                DW(style | WS_CHILD | WS_VISIBLE); DW(0);
+                W((WORD)x); W((WORD)y); W((WORD)w); W((WORD)h); W(id);
+                WS(cls); WS(text); W(0);
+            };
+
+        Item(SS_LEFT, 7, 7, 246, 8, 0xFFFF, L"STATIC", L"Old Author Name (leave blank to rename ALL authors):");
+        Item(ES_AUTOHSCROLL | WS_BORDER, 7, 18, 246, 14, ADL_OLD_EDIT, L"EDIT", L"");
+        Item(SS_LEFT, 7, 40, 246, 8, 0xFFFF, L"STATIC", L"New Author Name:");
+        Item(ES_AUTOHSCROLL | WS_BORDER, 7, 51, 246, 14, ADL_NEW_EDIT, L"EDIT", L"");
+        Item(BS_DEFPUSHBUTTON, 148, 80, 50, 14, IDOK, L"BUTTON", L"OK");
+        Item(BS_PUSHBUTTON, 203, 80, 50, 14, IDCANCEL, L"BUTTON", L"Cancel");
+
+        return reinterpret_cast<DLGTEMPLATE*>(buf);
+    }
+
+    // ----------------------------------------------------------------
+    // Document protection dialog
+    // ----------------------------------------------------------------
+    struct ProtDlgData {
+        bool currentlyProtected = false; // true if file already has enforcement=1
+        std::wstring chosenMode;         // "No protection" | "Read-Only" | etc.
+        std::wstring password;
+        bool accepted = false;
+    };
+
+#define PDL_COMBO   201
+#define PDL_PASSLBL 202
+#define PDL_PASS    203
+
+    static INT_PTR CALLBACK ProtDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam)
+    {
+        switch (msg) {
+        case WM_INITDIALOG:
+        {
+            SetWindowLongPtr(hDlg, GWLP_USERDATA, lParam);
+            ProtDlgData* d = reinterpret_cast<ProtDlgData*>(lParam);
+            SetWindowTextW(hDlg, L"Document Protection");
+            HWND hCombo = GetDlgItem(hDlg, PDL_COMBO);
+            // Always offer "No protection" (remove/clear enforcement)
+            SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)L"No protection");
+            if (!d->currentlyProtected) {
+                // Only offer protective modes when file is currently unprotected —
+                // we can't know the existing password so we can't modify protection in-place
+                SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)L"Read-Only");
+                SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)L"Forms");
+                SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)L"Comments");
+                SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)L"Tracked Changes");
+            }
+            SendMessageW(hCombo, CB_SETCURSEL, 0, 0);
+            // Password controls initially hidden (first selection is "No protection")
+            ShowWindow(GetDlgItem(hDlg, PDL_PASSLBL), SW_HIDE);
+            ShowWindow(GetDlgItem(hDlg, PDL_PASS), SW_HIDE);
+            return TRUE;
+        }
+        case WM_COMMAND:
+        {
+            if (HIWORD(wParam) == CBN_SELCHANGE && LOWORD(wParam) == PDL_COMBO) {
+                int sel = (int)SendMessageW(GetDlgItem(hDlg, PDL_COMBO), CB_GETCURSEL, 0, 0);
+                bool needPass = (sel > 0);
+                ShowWindow(GetDlgItem(hDlg, PDL_PASSLBL), needPass ? SW_SHOW : SW_HIDE);
+                ShowWindow(GetDlgItem(hDlg, PDL_PASS), needPass ? SW_SHOW : SW_HIDE);
+                return TRUE;
+            }
+            if (LOWORD(wParam) == IDOK) {
+                ProtDlgData* d = reinterpret_cast<ProtDlgData*>(GetWindowLongPtr(hDlg, GWLP_USERDATA));
+                HWND hCombo = GetDlgItem(hDlg, PDL_COMBO);
+                int sel = (int)SendMessageW(hCombo, CB_GETCURSEL, 0, 0);
+                wchar_t modeBuf[64] = {};
+                SendMessageW(hCombo, CB_GETLBTEXT, sel, (LPARAM)modeBuf);
+                d->chosenMode = modeBuf;
+                if (sel > 0) {
+                    wchar_t passBuf[256] = {};
+                    GetWindowTextW(GetDlgItem(hDlg, PDL_PASS), passBuf, 256);
+                    if (!passBuf[0]) {
+                        MessageBoxW(hDlg, L"Please enter a password.", L"Document Protection", MB_OK | MB_ICONWARNING);
+                        return TRUE;
+                    }
+                    d->password = passBuf;
+                }
+                d->accepted = true;
+                EndDialog(hDlg, IDOK);
+                return TRUE;
+            }
+            if (LOWORD(wParam) == IDCANCEL) { EndDialog(hDlg, IDCANCEL); return TRUE; }
+            break;
+        }
+        case WM_CLOSE: EndDialog(hDlg, IDCANCEL); return TRUE;
+        }
+        return FALSE;
+    }
+
+    static DLGTEMPLATE* BuildProtDlgTemplate()
+    {
+        static WORD buf[2048];
+        memset(buf, 0, sizeof(buf));
+        WORD* p = buf;
+        auto W = [&](WORD w) { *p++ = w; };
+        auto DW = [&](DWORD dw) { memcpy(p, &dw, 4); p += 2; };
+        auto WS = [&](const wchar_t* s) { while (*s) *p++ = (WORD)*s++; *p++ = 0; };
+        auto Al = [&]() { if ((DWORD_PTR)p & 2) *p++ = 0; };
+
+        // 6 controls, 240x105 DLUs
+        DW(DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU);
+        DW(0); W(6); W(0); W(0); W(240); W(105);
+        W(0); W(0); WS(L"Document Protection"); W(8); WS(L"MS Shell Dlg");
+
+        auto Item = [&](DWORD style, short x, short y, short w, short h, WORD id,
+            const wchar_t* cls, const wchar_t* text) {
+                Al();
+                DW(style | WS_CHILD | WS_VISIBLE); DW(0);
+                W((WORD)x); W((WORD)y); W((WORD)w); W((WORD)h); W(id);
+                WS(cls); WS(text); W(0);
+            };
+
+        Item(SS_LEFT, 7, 7, 226, 8, 0xFFFF, L"STATIC", L"Protection mode:");
+        Item(CBS_DROPDOWNLIST | WS_VSCROLL, 7, 18, 226, 80, PDL_COMBO, L"COMBOBOX", L"");
+        Item(SS_LEFT, 7, 50, 226, 8, PDL_PASSLBL, L"STATIC", L"Password (leave blank for no password):");
+        Item(ES_AUTOHSCROLL | ES_PASSWORD | WS_BORDER, 7, 61, 226, 14, PDL_PASS, L"EDIT", L"");
+        Item(BS_DEFPUSHBUTTON, 130, 83, 50, 14, IDOK, L"BUTTON", L"OK");
+        Item(BS_PUSHBUTTON, 183, 83, 50, 14, IDCANCEL, L"BUTTON", L"Cancel");
+
+        return reinterpret_cast<DLGTEMPLATE*>(buf);
+    }
+
+    // ----------------------------------------------------------------
+    // ContentEditValueW — custom dialog for FIELD_AUTHORS and
+    // FIELD_DOCUMENT_PROTECTION.  The three ft_multiplechoice fields
+    // (AUTO_UPDATE_STYLES, ANONYMISED_FILES, TCS_ON_OFF) don't need
+    // this — TC shows its own dropdown for those automatically.
+    // ----------------------------------------------------------------
+    __declspec(dllexport) int __stdcall ContentEditValueW(
+        HWND parentWin, int fieldIndex, int unitIndex,
+        int fieldType, void* fieldValue, int maxLen, int flags,
+        const char* langIdentifier)
+    {
+        DbgLog("ContentEditValue called: fieldIndex=%d fieldType=%d\n", fieldIndex, fieldType);
+        if (fieldIndex != FIELD_AUTHORS && fieldIndex != FIELD_DOCUMENT_PROTECTION)
+            return ft_notsupported;
+        if (!fieldValue) return ft_fieldempty;
+
+        // ---- Author rename dialog ----
+        if (fieldIndex == FIELD_AUTHORS) {
+            AuthorDlgData dlgData;
+            if (DialogBoxIndirectParamW(GetModuleHandleW(nullptr), BuildAuthorDlgTemplate(),
+                parentWin, AuthorDlgProc, reinterpret_cast<LPARAM>(&dlgData)) != IDOK || !dlgData.accepted)
+                return ft_setcancel;
+
+            // Use a printable delimiter "|" instead of \x01 to avoid UI corruption
+            std::wstring encoded = dlgData.oldAuthor + L"|" + dlgData.newAuthor;
+
+            if (fieldType == ft_stringw) {
+                // maxLen in TC is passed in bytes. Divide by sizeof(WCHAR) for characters.
+                wcsncpy_s(static_cast<WCHAR*>(fieldValue), maxLen / sizeof(WCHAR), encoded.c_str(), _TRUNCATE);
+            }
+            return ft_setsuccess;
+        }
+
+        // ---- Document protection dialog ----
+        if (fieldIndex == FIELD_DOCUMENT_PROTECTION) {
+            ProtDlgData dlgData;
+            // Default to "No protection" initially. Safe for bulk editing.
+            dlgData.currentlyProtected = false;
+
+            if (DialogBoxIndirectParamW(GetModuleHandleW(nullptr), BuildProtDlgTemplate(),
+                parentWin, ProtDlgProc, reinterpret_cast<LPARAM>(&dlgData)) != IDOK || !dlgData.accepted)
+                return ft_setcancel;
+
+            std::wstring encoded = dlgData.chosenMode + L"|" + dlgData.password;
+
+            if (fieldType == ft_stringw) {
+                wcsncpy_s(static_cast<WCHAR*>(fieldValue), maxLen / sizeof(WCHAR), encoded.c_str(), _TRUNCATE);
+            }
+            return ft_setsuccess;
+        }
+
+        return ft_notsupported;
+    }
+
+    // ANSI shim — TC 32/64-bit ALWAYS calls this because ContentEditValueW is not officially supported by TC.
+    __declspec(dllexport) int __stdcall ContentEditValue(
+        HWND parentWin, int fieldIndex, int unitIndex,
+        int fieldType, char* fieldValue, int maxLen, int flags,
+        const char* langIdentifier)
+    {
+        DbgLog("ContentEditValue called: fieldIndex=%d fieldType=%d\n", fieldIndex, fieldType);
+        if (fieldIndex != FIELD_AUTHORS && fieldIndex != FIELD_DOCUMENT_PROTECTION)
+            return ft_notsupported;
+
+        // Let ContentEditValueW handle the writing. Because fieldType is ft_stringw, 
+        // it will cast fieldValue to WCHAR* and write the string directly into TC's buffer.
+        return ContentEditValueW(parentWin, fieldIndex, unitIndex, fieldType,
+            static_cast<void*>(fieldValue), maxLen, flags, langIdentifier);
+    }
+
+    // Returns a priority score based on ISO/IEC 29500 w:settings sequence.
+    int GetSettingsElementPriority(const char* name) {
+        if (!name) return 9999;
+        std::string s(name);
+        if (s == "w:zoom") return 30;
+        if (s == "w:removePersonalInformation") return 40;
+        if (s == "w:removeDateAndTime") return 50;
+        if (s == "w:linkStyles") return 260;
+        if (s == "w:trackRevisions") return 320;
+        if (s == "w:documentProtection") return 350;
+        if (s == "w:defaultTabStop") return 390;
+        if (s == "w:compat") return 720;
+        if (s == "w:rsids") return 740;
+        if (s == "w:mathPr") return 750;
+        if (s == "w:themeFontLang") return 770;
+        if (s == "w:clrSchemeMapping") return 780;
+        if (s == "w:shapeDefaults") return 790;
+        if (s == "w:decimalSymbol") return 870;
+        if (s == "w:listSeparator") return 880;
+        return 999; // Unknowns go near the end, but before core bottom elements
+    }
+
+    // Inserts the new element safely before the first element that has a lower priority rank.
+    void InsertSettingsElement(tinyxml2::XMLElement* root, tinyxml2::XMLElement* newEl) {
+        if (!root || !newEl) return;
+        int newRank = GetSettingsElementPriority(newEl->Name());
+
+        for (tinyxml2::XMLElement* child = root->FirstChildElement(); child; child = child->NextSiblingElement()) {
+            if (GetSettingsElementPriority(child->Name()) > newRank) {
+                // tinyxml2 doesn't have InsertBeforeChild, so we use InsertAfterChild on the previous node
+                tinyxml2::XMLNode* prev = child->PreviousSibling();
+                if (prev) {
+                    root->InsertAfterChild(prev, newEl);
+                }
+                else {
+                    root->InsertFirstChild(newEl); // It's the first element
+                }
+                return;
+            }
+        }
+        root->InsertEndChild(newEl);
+    }
+
     __declspec(dllexport) int __stdcall ContentSetValueW(
         WCHAR* fileName, int fieldIndex, int unitIndex,
         int fieldType, void* fieldValue, int flags)
     {
+        DbgLog("ContentSetValueW called: fieldIndex=%d fieldType=%d fieldValue=%p\n", fieldIndex, fieldType, fieldValue);
+
+        // TC sends fieldIndex=-1 with FileName=NULL as a "commit/finalise" sentinel
+        // after all changes for a file. This MUST be checked before the NULL filename
+        // guard, because TC passes NULL for FileName on the sentinel call.
+        if (fieldIndex == -1) {
+            ClearCache();
+            return ft_setsuccess;
+        }
+
         if (!fileName) return ft_fieldempty;
         std::string ansiPath;
         if (!WidePathToAnsi(fileName, ansiPath)) return ft_fieldempty;
@@ -1825,6 +2405,303 @@ extern "C" {
         }
         return ft_setsuccess;
 
+        // ----------------------------------------------------------------
+                // Auto Update Styles — Yes/No -> w:linkStyles
+                // ----------------------------------------------------------------
+        case FIELD_AUTO_UPDATE_STYLES: {
+            if (!fieldValue) return ft_fieldempty;
+
+            // TC passes a 1-based integer index for ft_multiplechoice.
+            // Units: "Yes|No" → 1 = Yes (enable), 2 = No (disable)
+            const char* choiceText = GetIndirectAnsiChoiceText(fieldValue);
+            DbgLog("FIELD_AUTO_UPDATE_STYLES: fieldValue=%p nestedChoice=%s\n",
+                fieldValue, choiceText ? choiceText : "(null)");
+            int idx = NormalizeChoiceIndex(fieldIndex, fieldValue, 2);
+            if (idx < 0) return ft_fieldempty;
+            bool enable = (idx == 0);
+            DbgLog("FIELD_AUTO_UPDATE_STYLES: idx=%d enable=%d\n", idx, (int)enable);
+
+            std::string settingsXml;
+            if (!ExtractFileFromZip(ansiPath.c_str(), "word/settings.xml", settingsXml))
+                return ft_fileerror;
+
+            tinyxml2::XMLDocument doc;
+            if (doc.Parse(settingsXml.c_str()) != tinyxml2::XML_SUCCESS)
+                return ft_fileerror;
+
+            tinyxml2::XMLElement* root = doc.FirstChildElement("w:settings");
+            if (!root) return ft_fileerror;
+
+            tinyxml2::XMLElement* el = root->FirstChildElement("w:linkStyles");
+            if (enable) {
+                if (!el) {
+                    el = doc.NewElement("w:linkStyles");
+                    InsertSettingsElement(root, el);
+                }
+                el->SetAttribute("w:val", "true");
+            }
+            else {
+                if (el) root->DeleteChild(el);
+            }
+
+            tinyxml2::XMLPrinter printer(nullptr, true);
+            doc.Accept(&printer);
+            bool saved = SaveXmlToZip(ansiPath.c_str(), "word/settings.xml", printer.CStr());
+
+            DbgLog("FIELD_AUTO_UPDATE_STYLES: idx=%d enable=%d saved=%d\n", idx, (int)enable, (int)saved);
+
+            ClearCache();
+            return ft_setsuccess;
+        }
+
+                                     // ----------------------------------------------------------------
+                                     // Files Anonymised 
+                                     // ----------------------------------------------------------------
+        case FIELD_ANONYMISED_FILES: {
+            if (!fieldValue) return ft_fieldempty;
+
+            // TC passes a 1-based integer index for ft_multiplechoice.
+            // Units: "No|Personal Information|Date and Time|Personal Information and Date and Time"
+            // 1 = No, 2 = Personal Information, 3 = Date and Time, 4 = Both
+            const char* choiceText = GetIndirectAnsiChoiceText(fieldValue);
+            DbgLog("FIELD_ANONYMISED_FILES: fieldValue=%p nestedChoice=%s\n",
+                fieldValue, choiceText ? choiceText : "(null)");
+            int idx = NormalizeChoiceIndex(fieldIndex, fieldValue, 4);
+            if (idx < 0) return ft_fieldempty;
+            DbgLog("FIELD_ANONYMISED_FILES: idx=%d\n", idx);
+
+            bool removePI = (idx == 1 || idx == 3);
+            bool removeDate = (idx == 2 || idx == 3);
+
+            std::string settingsXml;
+            if (!ExtractFileFromZip(ansiPath.c_str(), "word/settings.xml", settingsXml))
+                return ft_fileerror;
+
+            tinyxml2::XMLDocument doc;
+            if (doc.Parse(settingsXml.c_str()) != tinyxml2::XML_SUCCESS)
+                return ft_fileerror;
+
+            tinyxml2::XMLElement* root = doc.FirstChildElement("w:settings");
+            if (!root) return ft_fileerror;
+
+            auto setFlag = [&](const char* localName, bool enableFlag) {
+                // Word XML tags are usually prefixed with w:
+                std::string fullName = std::string("w:") + localName;
+
+                // Search for both prefixed and non-prefixed just in case
+                tinyxml2::XMLElement* el = root->FirstChildElement(fullName.c_str());
+                if (!el) el = root->FirstChildElement(localName);
+
+                if (enableFlag) {
+                    if (!el) {
+                        el = doc.NewElement(fullName.c_str());
+                        // Make sure your InsertSettingsElement places it inside <w:settings>
+                        InsertSettingsElement(root, el);
+                    }
+                    el->SetAttribute("w:val", "true");
+                }
+                else {
+                    if (el) {
+                        root->DeleteChild(el);
+                    }
+                }
+                };
+
+            // Call without the "w:" prefix now
+            setFlag("removePersonalInformation", removePI);
+            setFlag("removeDateAndTime", removeDate);
+
+            tinyxml2::XMLPrinter printer(nullptr, true);
+            doc.Accept(&printer);
+            bool saved = SaveXmlToZip(ansiPath.c_str(), "word/settings.xml", printer.CStr());
+
+            DbgLog("FIELD_ANONYMISED_FILES: idx=%d removePI=%d removeDate=%d saved=%d\n",
+                idx, (int)removePI, (int)removeDate, (int)saved);
+
+            ClearCache();
+            return ft_setsuccess;
+        }
+
+        // ----------------------------------------------------------------
+        // Track Changes — Activated/Deactivated
+        // ----------------------------------------------------------------
+        case FIELD_TCS_ON_OFF: {
+            if (!fieldValue) return ft_fieldempty;
+
+            // TC passes a 1-based integer index for ft_multiplechoice.
+            // Units: "Activated|Deactivated" → 1 = Activated (enable), 2 = Deactivated (disable)
+            const char* choiceText = GetIndirectAnsiChoiceText(fieldValue);
+            DbgLog("FIELD_TCS_ON_OFF: fieldValue=%p nestedChoice=%s\n",
+                fieldValue, choiceText ? choiceText : "(null)");
+            int idx = NormalizeChoiceIndex(fieldIndex, fieldValue, 2);
+            if (idx < 0) return ft_fieldempty;
+            bool enable = (idx == 0);
+            DbgLog("FIELD_TCS_ON_OFF: idx=%d enable=%d\n", idx, (int)enable);
+
+            std::string settingsXml;
+            if (!ExtractFileFromZip(ansiPath.c_str(), "word/settings.xml", settingsXml))
+                return ft_fileerror;
+
+            tinyxml2::XMLDocument doc;
+            if (doc.Parse(settingsXml.c_str()) != tinyxml2::XML_SUCCESS)
+                return ft_fileerror;
+
+            tinyxml2::XMLElement* root = doc.FirstChildElement("w:settings");
+            if (!root) return ft_fileerror;
+
+            // Track Changes in Word XML is the <w:trackRevisions> element
+            tinyxml2::XMLElement* el = root->FirstChildElement("w:trackRevisions");
+            if (enable) {
+                if (!el) {
+                    el = doc.NewElement("w:trackRevisions");
+                    InsertSettingsElement(root, el);
+                }
+                // Word usually treats the presence of the tag as "on", 
+                // but w:val="true" is the explicit standard.
+                el->SetAttribute("w:val", "true");
+            }
+            else {
+                if (el) root->DeleteChild(el);
+            }
+
+            tinyxml2::XMLPrinter printer(nullptr, true);
+            doc.Accept(&printer);
+            bool saved = SaveXmlToZip(ansiPath.c_str(), "word/settings.xml", printer.CStr());
+
+            DbgLog("FIELD_TCS_ON_OFF: idx=%d enable=%d saved=%d\n", idx, (int)enable, (int)saved);
+
+            ClearCache();
+            return ft_setsuccess;
+        }
+
+        // ----------------------------------------------------------------
+        // Document Protection — set or clear w:documentProtection
+        // ----------------------------------------------------------------
+        // ----------------------------------------------------------------
+        // Document Protection — value encoded as "Mode\x01Password"
+        // from ContentEditValueW.  Always clears enforcement first,
+        // then re-applies the chosen mode (+ password hash if given).
+        // Uses the Word 97 XOR password hash (w:cryptAlgorithmSid="1")
+        // which Word accepts without needing SHA512/bcrypt complexity.
+        // ----------------------------------------------------------------
+        case FIELD_DOCUMENT_PROTECTION:
+        {
+            if (!fieldValue) return ft_fieldempty;
+            std::wstring encoded(static_cast<const wchar_t*>(fieldValue));
+
+            std::string mode;
+            std::wstring wPass;
+            auto sep = encoded.find(L'|');
+            if (sep == std::wstring::npos) {
+                mode = WideToUtf8(encoded);
+                wPass = L""; // Fallback to no password if typed manually
+            }
+            else {
+                mode = WideToUtf8(encoded.substr(0, sep));
+                wPass = encoded.substr(sep + 1);
+            }
+
+            std::string settingsXml;
+            if (!ExtractFileFromZip(ansiPath.c_str(), "word/settings.xml", settingsXml)) return ft_fileerror;
+            tinyxml2::XMLDocument doc;
+            if (doc.Parse(settingsXml.c_str()) != tinyxml2::XML_SUCCESS) return ft_fileerror;
+            tinyxml2::XMLElement* root = doc.FirstChildElement("w:settings");
+            if (!root) return ft_fileerror;
+
+            // Always remove existing protection element first (clears any prior enforcement/password)
+            tinyxml2::XMLElement* prot = root->FirstChildElement("w:documentProtection");
+            if (prot) root->DeleteChild(prot);
+
+            if (mode != "No protection") {
+                const char* editVal =
+                    mode == "Read-Only" ? "readOnly" :
+                    mode == "Forms" ? "forms" :
+                    mode == "Comments" ? "comments" :
+                    mode == "Tracked Changes" ? "trackedChanges" : nullptr;
+                if (!editVal) return ft_fileerror;
+
+                prot = doc.NewElement("w:documentProtection");
+                prot->SetAttribute("w:edit", editVal);
+                prot->SetAttribute("w:enforcement", "1");
+
+                if (!wPass.empty()) {
+                    // Word 97 XOR password hash — universally accepted by Word versions
+                    // Reference: ECMA-376 Part 4 §14.7.1 / MS-OI29500
+                    static const WORD encMatrix[15][7] = {
+                        {0xAEFC,0x4DD9,0x9BB2,0x2745,0x4E8A,0x9D14,0x2A28},
+                        {0x5450,0xA8A0,0x5141,0xA282,0x4584,0x8B08,0x1610},
+                        {0x2C20,0x5840,0xB080,0x60B1,0xC162,0x8E45,0x1C8A},
+                        {0x3914,0x7228,0xE450,0xCEA1,0x9C43,0x3887,0x710E},
+                        {0xE21C,0xC439,0x8873,0x10E6,0x21CC,0x4398,0x8730},
+                        {0x0E60,0x1CC0,0x3980,0x7300,0xE600,0xCC01,0x9803},
+                        {0x3006,0x600C,0xC018,0x8031,0x0162,0x02C4,0x0588},
+                        {0x0B10,0x1620,0x2C40,0x5880,0xB100,0x7201,0xE402},
+                        {0xC805,0x8B0B,0x1616,0x2C2C,0x5858,0xB0B0,0x6161},
+                        {0xC2C2,0x8585,0x0B0B,0x1616,0x2C2C,0x5858,0xB0B0},
+                        {0x6161,0xC2C2,0x8585,0x0B0B,0x1616,0x2C2C,0x5858},
+                        {0xB0B0,0x6161,0xC2C2,0x8585,0x0B0B,0x1616,0x2C2C},
+                        {0x5858,0xB0B0,0x6161,0xC2C2,0x8585,0x0B0B,0x1616},
+                        {0x2C2C,0x5858,0xB0B0,0x6161,0xC2C2,0x8585,0x0B0B},
+                        {0x1616,0x2C2C,0x5858,0xB0B0,0x6161,0xC2C2,0x8585}
+                    };
+                    // Convert password to Latin-1 bytes (Word 97 hashes byte values)
+                    std::string pass;
+                    for (wchar_t ch : wPass) pass += (char)(ch & 0xFF);
+                    int len = (int)pass.size();
+                    WORD hash = 0;
+                    for (int i = len - 1; i >= 0; --i) {
+                        hash ^= (WORD)(unsigned char)pass[i];
+                        for (int bit = 0; bit < 7; ++bit) {
+                            if (hash & 0x4000) hash = ((hash << 1) & 0x7FFF) ^ 0x6072;
+                            else               hash = (hash << 1) & 0x7FFF;
+                        }
+                    }
+                    hash ^= (WORD)len;
+                    hash ^= 0xCE4B;
+                    char hashHex[8]; snprintf(hashHex, sizeof(hashHex), "%04X", (unsigned)hash);
+                    prot->SetAttribute("w:cryptAlgorithmClass", "hash");
+                    prot->SetAttribute("w:cryptAlgorithmType", "typeAny");
+                    prot->SetAttribute("w:cryptAlgorithmSid", "1");     // XOR (Word 97)
+                    prot->SetAttribute("w:cryptSpinCount", "0");
+                    prot->SetAttribute("w:hash", hashHex);
+                    prot->SetAttribute("w:salt", "");
+                }
+                InsertSettingsElement(root, prot);
+            }
+
+            tinyxml2::XMLPrinter printer(nullptr, true); doc.Accept(&printer);
+            SaveXmlToZip(ansiPath.c_str(), "word/settings.xml", printer.CStr());
+            ClearCache();
+        }
+        return ft_setsuccess;
+
+        // ----------------------------------------------------------------
+        // Tracked Change Authors — rename; value encoded as "OLD\x01NEW"
+        // (written by ContentEditValueW; empty OLD = rename all authors)
+        // ----------------------------------------------------------------
+        case FIELD_AUTHORS:
+        {
+            if (!fieldValue) return ft_fieldempty;
+            std::wstring encoded(static_cast<const wchar_t*>(fieldValue));
+
+            std::string oldName;
+            std::string newName;
+            auto sep = encoded.find(L'|');
+            if (sep == std::wstring::npos) {
+                oldName = ""; // Empty = rename all
+                newName = WideToUtf8(encoded);
+            }
+            else {
+                oldName = WideToUtf8(encoded.substr(0, sep));
+                newName = WideToUtf8(encoded.substr(sep + 1));
+            }
+
+            if (newName.empty()) return ft_fieldempty;
+
+            if (!RenameTrackedChangeAuthors(ansiPath, oldName, newName)) return ft_fileerror;
+        }
+        return ft_setsuccess;
+
         default:
             return ft_notsupported;
         }
@@ -1834,8 +2711,17 @@ extern "C" {
 
 extern "C" __declspec(dllexport) int __stdcall ContentSetValue(
     char* fileName, int fieldIndex, int unitIndex,
-    void* fieldValue, int maxLen, int flags)
+    int fieldType, void* fieldValue, int flags)
 {
+    DbgLog("ContentSetValue called: fieldIndex=%d\n", fieldIndex);
+
+    // TC sends fieldIndex=-1 with FileName=NULL as a "commit/finalise" sentinel.
+    // This MUST be checked before the NULL filename guard.
+    if (fieldIndex == -1) {
+        ClearCache();
+        return ft_setsuccess;
+    }
+
     if (!fileName) return ft_fieldempty;
 
     int needed = MultiByteToWideChar(CP_ACP, 0, fileName, -1, NULL, 0);
@@ -1843,74 +2729,23 @@ extern "C" __declspec(dllexport) int __stdcall ContentSetValue(
     std::wstring wfn; wfn.resize(needed - 1);
     MultiByteToWideChar(CP_ACP, 0, fileName, -1, &wfn[0], needed);
 
-    const void* passValue = nullptr;
+    const void* passValue = fieldValue;
     std::wstring widebuf;
 
     if (fieldValue) {
-        // Numeric and date fields are passed through as raw bytes; string fields are converted to wide
-        if (fieldIndex == FIELD_CORE_REVISION_NUMBER ||
-            fieldIndex == FIELD_APP_EDITING_TIME ||
-            fieldIndex == FIELD_CORE_CREATED_DATE ||
-            fieldIndex == FIELD_CORE_MODIFIED_DATE ||
-            fieldIndex == FIELD_CORE_LAST_PRINTED_DATE)
-        {
-            passValue = fieldValue;
-        }
-        else {
-            std::string s_in(static_cast<const char*>(fieldValue), maxLen);
-            size_t pos = s_in.find('\0');
-            if (pos != std::string::npos) s_in.resize(pos);
-
-            auto IsValidUtf8 = [&](const std::string& s) {
-                const unsigned char* bytes = (const unsigned char*)s.c_str();
-                size_t len = s.size();
-                size_t i = 0;
-                while (i < len) {
-                    unsigned char c = bytes[i];
-                    if (c <= 0x7F) { i++; continue; }
-                    else if ((c & 0xE0) == 0xC0) {
-                        if (i + 1 >= len) return false;
-                        if ((bytes[i + 1] & 0xC0) != 0x80) return false;
-                        i += 2; continue;
-                    }
-                    else if ((c & 0xF0) == 0xE0) {
-                        if (i + 2 >= len) return false;
-                        if ((bytes[i + 1] & 0xC0) != 0x80 || (bytes[i + 2] & 0xC0) != 0x80) return false;
-                        i += 3; continue;
-                    }
-                    else if ((c & 0xF8) == 0xF0) {
-                        if (i + 3 >= len) return false;
-                        if ((bytes[i + 1] & 0xC0) != 0x80 || (bytes[i + 2] & 0xC0) != 0x80 || (bytes[i + 3] & 0xC0) != 0x80) return false;
-                        i += 4; continue;
-                    }
-                    else return false;
-                }
-                return true;
-                };
-
-            int codepage = CP_ACP;
-            if (IsValidUtf8(s_in)) codepage = CP_UTF8;
-
-            int wneeded = MultiByteToWideChar(codepage, 0, s_in.c_str(), -1, NULL, 0);
-            if (wneeded <= 0) return ft_fieldempty;
-            widebuf.resize(wneeded - 1);
-            MultiByteToWideChar(codepage, 0, s_in.c_str(), -1, &widebuf[0], wneeded);
-            passValue = widebuf.c_str();
+        // For string fields only: convert ANSI -> wide.
+        // ft_multiplechoice is excluded: TC passes a pointer to a 1-based int index,
+        // not a string. Pass the int* straight through unchanged.
+        if (fieldType == ft_string || fieldType == ft_stringw) {
+            const char* src = static_cast<const char*>(fieldValue);
+            int wneeded = MultiByteToWideChar(CP_ACP, 0, src, -1, NULL, 0);
+            if (wneeded > 0) {
+                widebuf.resize(wneeded - 1);
+                MultiByteToWideChar(CP_ACP, 0, src, -1, &widebuf[0], wneeded);
+                passValue = widebuf.c_str();
+            }
         }
     }
 
-    int fType = ft_stringw;
-    switch (fieldIndex) {
-    case FIELD_CORE_REVISION_NUMBER:
-    case FIELD_APP_EDITING_TIME:
-        fType = ft_numeric_32; break;
-    case FIELD_CORE_CREATED_DATE:
-    case FIELD_CORE_MODIFIED_DATE:
-    case FIELD_CORE_LAST_PRINTED_DATE:
-        fType = ft_datetime; break;
-    default:
-        fType = ft_stringw; break;
-    }
-
-    return ContentSetValueW(&wfn[0], fieldIndex, unitIndex, fType, const_cast<void*>(passValue), flags);
+    return ContentSetValueW(&wfn[0], fieldIndex, unitIndex, fieldType, const_cast<void*>(passValue), flags);
 }
