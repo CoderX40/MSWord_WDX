@@ -3,11 +3,19 @@
 #include <string>
 
 #ifndef _WIN64
+#pragma comment(linker, "/export:ContentGetDetectString=_ContentGetDetectString@8")
+#pragma comment(linker, "/export:ContentGetDetectStringW=_ContentGetDetectStringW@8")
 #pragma comment(linker, "/export:ContentGetSupportedField=_ContentGetSupportedField@16")
 #pragma comment(linker, "/export:ContentGetValue=_ContentGetValue@24")
 #pragma comment(linker, "/export:ContentGetValueW=_ContentGetValueW@24")
 #pragma comment(linker, "/export:ContentGetSupportedFieldFlags=_ContentGetSupportedFieldFlags@4")
 #pragma comment(linker, "/export:ContentGetDefaultSortOrder=_ContentGetDefaultSortOrder@4")
+#pragma comment(linker, "/export:ContentSendStateInformation=_ContentSendStateInformation@8")
+#pragma comment(linker, "/export:ContentSendStateInformationW=_ContentSendStateInformationW@8")
+#pragma comment(linker, "/export:ContentSetDefaultParams=_ContentSetDefaultParams@4")
+#pragma comment(linker, "/export:ContentStopGetValue=_ContentStopGetValue@0")
+#pragma comment(linker, "/export:ContentStopGetValueW=_ContentStopGetValueW@0")
+#pragma comment(linker, "/export:ContentPluginUnloading=_ContentPluginUnloading@0")
 #pragma comment(linker, "/export:ContentSetValue=_ContentSetValue@24")
 #pragma comment(linker, "/export:ContentSetValueW=_ContentSetValueW@24")
 #pragma comment(linker, "/export:ContentEditValue=_ContentEditValue@32")
@@ -88,7 +96,10 @@ __declspec(dllexport) void __stdcall ContentSetDefaultParams(void* dparm)
 {
     if (!dparm) return;
     const char* pIniPath = SafeGetIniPathAnsi(dparm);
-    if (pIniPath) SetPluginDefaultIniPath(pIniPath);
+    if (pIniPath) {
+        SetPluginDefaultIniPath(pIniPath);
+        RefreshPluginLanguageCache();
+    }
 }
 
 __declspec(dllexport) void __stdcall ContentStopGetValue(void)
@@ -140,6 +151,21 @@ __declspec(dllexport) void __stdcall ContentPluginUnloading(void)
 {
     g_cancelRequested.store(true, std::memory_order_relaxed);
     ClearCache();
+}
+
+__declspec(dllexport) void __stdcall ContentSendStateInformation(int state, char* path)
+{
+    UNREFERENCED_PARAMETER(path);
+    if (state == 1 || state == 2) {
+        RefreshPluginLanguageCache();
+        ClearCache();
+    }
+}
+
+__declspec(dllexport) void __stdcall ContentSendStateInformationW(int state, WCHAR* path)
+{
+    UNREFERENCED_PARAMETER(path);
+    ContentSendStateInformation(state, nullptr);
 }
 
 __declspec(dllexport) int __stdcall ContentEditValueW(HWND parentWin, int fieldIndex, int unitIndex, int fieldType, void* fieldValue, int maxLen, int flags, const char* langIdentifier)

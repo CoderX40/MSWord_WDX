@@ -162,6 +162,7 @@ int NormalizeChoiceIndex(int fieldIndex, const void* fieldValue, int choiceCount
 const char* GetIndirectAnsiChoiceText(const void* fieldValue);
 void SetPluginDefaultIniPath(const std::string& iniPath);
 std::string TranslatePluginText(const std::string& englishText);
+void RefreshPluginLanguageCache();
 
 int GetContentValueWInternal(const std::string& ansiPath, int fieldIndex, int unitIndex, void* fieldValue, int maxLen);
 int GetContentValueInternal(const std::string& ansiPath, int fieldIndex, int unitIndex, void* fieldValue, int maxLen);

@@ -2,6 +2,7 @@
 
 #include "plugin_shared.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -16,6 +17,8 @@ std::mutex g_cacheMutex;
 CachedParts g_cachedParts;
 std::mutex g_languageMutex;
 std::string g_defaultIniPath;
+std::string g_cachedLanguageCode = "eng";
+FILETIME g_cachedIniWriteTime{};
 
 const FieldDescriptor kFieldDescriptors[FIELD_COUNT] = {
     {"Title", "", ft_stringw, contflags_edit},
@@ -285,26 +288,208 @@ std::string ExtractLanguageCode(const std::string& value)
     return std::string();
 }
 
-std::string DetectCurrentLanguageCode()
+std::string NormalizeLanguageCode(const std::string& rawCode)
 {
-    if (g_defaultIniPath.empty()) return "eng";
+    if (rawCode.empty()) return "eng";
+
+    std::string code = rawCode;
+    for (char& ch : code) {
+        ch = static_cast<char>(tolower(static_cast<unsigned char>(ch)));
+    }
+
+    if (code == "en" || code == "eng" || code == "enu") return "eng";
+    if (code == "fr" || code == "fre" || code == "fra") return "fra";
+    if (code == "pt" || code == "ptg" || code == "por") return "por";
+
+    return code;
+}
+
+std::vector<std::string> GetLanguageSectionCandidates(const std::string& rawCode)
+{
+    std::vector<std::string> candidates;
+
+    auto addCandidate = [&](const std::string& value) {
+        if (value.empty()) return;
+        if (std::find(candidates.begin(), candidates.end(), value) == candidates.end()) {
+            candidates.push_back(value);
+        }
+    };
+
+    std::string normalized = NormalizeLanguageCode(rawCode);
+    addCandidate(normalized);
+    addCandidate(rawCode);
+
+    if (normalized == "eng") addCandidate("enu");
+    if (normalized == "enu") addCandidate("eng");
+
+    addCandidate("eng");
+    return candidates;
+}
+
+std::string GetDefaultIniPathFallback()
+{
+    const char* envNames[] = { "APPDATA", "LOCALAPPDATA", "WINDIR" };
+    const char* suffixes[] = {
+        "\\GHISLER\\wincmd.ini",
+        "\\wincmd.ini"
+    };
+
+    char buffer[MAX_PATH] = {};
+    for (const char* envName : envNames) {
+        DWORD len = GetEnvironmentVariableA(envName, buffer, static_cast<DWORD>(std::size(buffer)));
+        if (len == 0 || len >= std::size(buffer)) {
+            continue;
+        }
+
+        for (const char* suffix : suffixes) {
+            std::string candidate = std::string(buffer) + suffix;
+            DWORD attrs = GetFileAttributesA(candidate.c_str());
+            if (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+                return candidate;
+            }
+        }
+    }
+
+    return std::string();
+}
+
+std::string ResolveWinCmdIniPath(const std::string& iniPath)
+{
+    if (iniPath.empty()) return std::string();
+
+    DWORD attrs = GetFileAttributesA(iniPath.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+        return std::string();
+    }
+
+    std::string lowered = iniPath;
+    for (char& ch : lowered) {
+        ch = static_cast<char>(tolower(static_cast<unsigned char>(ch)));
+    }
+
+    const std::string contplugName = "contplug.ini";
+    const std::string wincmdName = "wincmd.ini";
+
+    if (lowered.size() >= contplugName.size() &&
+        lowered.compare(lowered.size() - contplugName.size(), contplugName.size(), contplugName) == 0) {
+        std::string candidate = iniPath.substr(0, iniPath.size() - contplugName.size()) + wincmdName;
+        DWORD candidateAttrs = GetFileAttributesA(candidate.c_str());
+        if (candidateAttrs != INVALID_FILE_ATTRIBUTES && !(candidateAttrs & FILE_ATTRIBUTE_DIRECTORY)) {
+            DbgLog("ResolveWinCmdIniPath: '%s' -> sibling '%s'\n", iniPath.c_str(), candidate.c_str());
+            return candidate;
+        }
+
+        std::string fallback = GetDefaultIniPathFallback();
+        if (!fallback.empty()) {
+            DbgLog("ResolveWinCmdIniPath: sibling missing for '%s', fallback '%s'\n", iniPath.c_str(), fallback.c_str());
+            return fallback;
+        }
+    }
+
+    if (lowered.size() >= wincmdName.size() &&
+        lowered.compare(lowered.size() - wincmdName.size(), wincmdName.size(), wincmdName) == 0) {
+        return iniPath;
+    }
+
+    size_t slash = iniPath.find_last_of("\\/");
+    if (slash != std::string::npos) {
+        std::string candidate = iniPath.substr(0, slash + 1) + wincmdName;
+        DWORD candidateAttrs = GetFileAttributesA(candidate.c_str());
+        if (candidateAttrs != INVALID_FILE_ATTRIBUTES && !(candidateAttrs & FILE_ATTRIBUTE_DIRECTORY)) {
+            DbgLog("ResolveWinCmdIniPath: '%s' -> directory candidate '%s'\n", iniPath.c_str(), candidate.c_str());
+            return candidate;
+        }
+    }
+
+    DbgLog("ResolveWinCmdIniPath: keeping '%s'\n", iniPath.c_str());
+    return iniPath;
+}
+
+bool TryGetFileWriteTime(const std::string& path, FILETIME& writeTime)
+{
+    WIN32_FILE_ATTRIBUTE_DATA attrs{};
+    if (!GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &attrs)) {
+        return false;
+    }
+
+    writeTime = attrs.ftLastWriteTime;
+    return true;
+}
+
+std::string DetectCurrentLanguageCodeFromIniPath(const std::string& iniPath)
+{
+    if (iniPath.empty()) return "eng";
 
     const char* sections[] = { "Configuration", "International", "TC" };
-    const char* keys[] = { "LanguageIni", "Language", "Lang", "LanguageFile" };
+    const char* keys[] = { "LanguageINI", "LanguageIni", "Language", "Lang", "LanguageFile" };
     char buffer[MAX_PATH] = {};
 
     for (const char* section : sections) {
         for (const char* key : keys) {
             buffer[0] = '\0';
-            GetPrivateProfileStringA(section, key, "", buffer, static_cast<DWORD>(sizeof(buffer)), g_defaultIniPath.c_str());
+            GetPrivateProfileStringA(section, key, "", buffer, static_cast<DWORD>(sizeof(buffer)), iniPath.c_str());
             if (buffer[0]) {
                 std::string code = ExtractLanguageCode(buffer);
-                if (!code.empty()) return code;
+                if (!code.empty()) return NormalizeLanguageCode(code);
             }
         }
     }
 
     return "eng";
+}
+
+std::string DetectCurrentLanguageCode()
+{
+    std::string iniPath = g_defaultIniPath;
+    if (iniPath.empty()) {
+        iniPath = GetDefaultIniPathFallback();
+    }
+    return DetectCurrentLanguageCodeFromIniPath(ResolveWinCmdIniPath(iniPath));
+}
+
+void RefreshPluginLanguageCacheIfNeeded()
+{
+    std::string iniPath;
+    {
+        std::lock_guard<std::mutex> cacheLock(g_languageMutex);
+        iniPath = g_defaultIniPath;
+    }
+
+    if (iniPath.empty()) {
+        iniPath = GetDefaultIniPathFallback();
+    }
+    iniPath = ResolveWinCmdIniPath(iniPath);
+    if (iniPath.empty()) {
+        return;
+    }
+
+    FILETIME currentWriteTime{};
+    bool haveWriteTime = TryGetFileWriteTime(iniPath, currentWriteTime);
+
+    {
+        std::lock_guard<std::mutex> cacheLock(g_languageMutex);
+        if (!g_cachedLanguageCode.empty() && haveWriteTime &&
+            CompareFileTime(&currentWriteTime, &g_cachedIniWriteTime) == 0) {
+            return;
+        }
+    }
+
+    std::string detectedLanguageCode = DetectCurrentLanguageCodeFromIniPath(iniPath);
+    if (detectedLanguageCode.empty()) {
+        detectedLanguageCode = "eng";
+    }
+
+    std::lock_guard<std::mutex> cacheLock(g_languageMutex);
+    g_defaultIniPath = iniPath;
+    g_cachedLanguageCode = detectedLanguageCode;
+    if (haveWriteTime) {
+        g_cachedIniWriteTime = currentWriteTime;
+    }
+    else {
+        ZeroMemory(&g_cachedIniWriteTime, sizeof(g_cachedIniWriteTime));
+    }
+
+    DbgLog("Language cache refreshed: ini='%s' lang='%s'\n", iniPath.c_str(), g_cachedLanguageCode.c_str());
 }
 
 } // namespace
@@ -366,8 +551,20 @@ bool IsCanceled()
 
 void SetPluginDefaultIniPath(const std::string& iniPath)
 {
+    std::string resolvedIniPath = ResolveWinCmdIniPath(iniPath);
+    if (resolvedIniPath.empty()) {
+        resolvedIniPath = GetDefaultIniPathFallback();
+    }
+
     std::lock_guard<std::mutex> lock(g_languageMutex);
-    g_defaultIniPath = iniPath;
+    g_defaultIniPath = resolvedIniPath;
+    ZeroMemory(&g_cachedIniWriteTime, sizeof(g_cachedIniWriteTime));
+    DbgLog("SetPluginDefaultIniPath: raw='%s' stored='%s'\n", iniPath.c_str(), g_defaultIniPath.c_str());
+}
+
+void RefreshPluginLanguageCache()
+{
+    RefreshPluginLanguageCacheIfNeeded();
 }
 
 std::string TranslatePluginText(const std::string& englishText)
@@ -377,19 +574,35 @@ std::string TranslatePluginText(const std::string& englishText)
     std::wstring lngPath = GetPluginLngPath();
     if (lngPath.empty()) return englishText;
 
-    std::string langCode;
+    RefreshPluginLanguageCacheIfNeeded();
+
+    std::string langCode = "eng";
     {
-        std::lock_guard<std::mutex> lock(g_languageMutex);
-        langCode = DetectCurrentLanguageCode();
+        std::lock_guard<std::mutex> cacheLock(g_languageMutex);
+        if (!g_cachedLanguageCode.empty()) {
+            langCode = g_cachedLanguageCode;
+        }
     }
 
-    std::wstring section(langCode.begin(), langCode.end());
     std::wstring key;
     if (!Utf8ToWideString(englishText, key)) return englishText;
+    const wchar_t* missingSentinel = L"__PLUGIN_LNG_MISSING__";
 
-    wchar_t translated[1024] = {};
-    GetPrivateProfileStringW(section.c_str(), key.c_str(), key.c_str(), translated, static_cast<DWORD>(std::size(translated)), lngPath.c_str());
-    return WideToUtf8(std::wstring(translated));
+    for (const std::string& candidate : GetLanguageSectionCandidates(langCode)) {
+        std::wstring section(candidate.begin(), candidate.end());
+        wchar_t translated[1024] = {};
+        GetPrivateProfileStringW(section.c_str(), key.c_str(), missingSentinel, translated, static_cast<DWORD>(std::size(translated)), lngPath.c_str());
+        std::wstring translatedValue(translated);
+        if (!translatedValue.empty() && translatedValue != missingSentinel) {
+            std::string translatedUtf8 = WideToUtf8(translatedValue);
+            DbgLog("TranslatePluginText: lang='%s' candidate='%s' key='%s' -> '%s'\n",
+                langCode.c_str(), candidate.c_str(), englishText.c_str(), translatedUtf8.c_str());
+            return translatedUtf8;
+        }
+    }
+
+    DbgLog("TranslatePluginText: lang='%s' key='%s' -> fallback\n", langCode.c_str(), englishText.c_str());
+    return englishText;
 }
 
 std::string FileTimeToIso8601UTC(const FILETIME* ftUtc)
