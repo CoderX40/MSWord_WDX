@@ -27,6 +27,6 @@ Each linked page provides:
 * A description of the check category.
 * A table listing each specific field checked.
 * An explanation of the data type (String, DateTime, Int, Bool).
-* Potential use cases or common scenarios for why you might check this property.
+* Read (R) and Write (W) access and any applicable explanations.
 
 If you have any questions or suggestions, please refer to the main [Total Commander Plugin README](../README.md) or open an issue on the GitHub repository.
