@@ -78,4 +78,9 @@
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
+  <ItemGroup>
+    <None Include="MSWord_WDX.lng">
+      <Filter>Resource Files</Filter>
+    </None>
+  </ItemGroup>
 </Project>

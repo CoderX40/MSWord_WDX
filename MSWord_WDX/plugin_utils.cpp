@@ -14,9 +14,11 @@ namespace {
 
 std::mutex g_cacheMutex;
 CachedParts g_cachedParts;
+std::mutex g_languageMutex;
+std::string g_defaultIniPath;
 
 const FieldDescriptor kFieldDescriptors[FIELD_COUNT] = {
-    {"Document Title", "", ft_stringw, contflags_edit},
+    {"Title", "", ft_stringw, contflags_edit},
     {"Subject", "", ft_stringw, contflags_edit},
     {"Author", "", ft_stringw, contflags_edit},
     {"Manager", "", ft_stringw, contflags_edit},
@@ -39,17 +41,17 @@ const FieldDescriptor kFieldDescriptors[FIELD_COUNT] = {
     {"Compatibility mode", "", ft_boolean, 0},
     {"Hidden text", "", ft_boolean, 0},
     {"Number of comments", "", ft_numeric_32, 0},
-    {"Document Protection", "", ft_stringw, contflags_edit | contflags_fieldedit},
-    {"Auto Update Styles", "Yes|No", ft_multiplechoice, contflags_edit},
-    {"Files Anonymised", "No|Personal Information|Date and Time|Personal Information and Date and Time", ft_multiplechoice, contflags_edit},
-    {"Tracked Changes Present in Document", "", ft_boolean, 0},
-    {"Track Changes", "Activated|Deactivated", ft_multiplechoice, contflags_edit},
-    {"Tracked Changes Authors", "", ft_stringw, contflags_edit | contflags_fieldedit},
-    {"Total Revisions", "", ft_numeric_32, 0},
-    {"Total Insertions", "", ft_numeric_32, 0},
-    {"Total Deletions", "", ft_numeric_32, 0},
-    {"Total Moves", "", ft_numeric_32, 0},
-    {"Total Formatting Changes", "", ft_numeric_32, 0},
+    {"Document protection", "", ft_stringw, contflags_edit | contflags_fieldedit},
+    {"Auto update styles", "Yes|No", ft_multiplechoice, contflags_edit},
+    {"Anonymisation", "No|Personal information|Date and time|Personal information, Date and time", ft_multiplechoice, contflags_edit},
+    {"Contains tracked changes", "", ft_boolean, 0},
+    {"Track changes mode", "Enabled|Disabled", ft_multiplechoice, contflags_edit},
+    {"Tracked changes authors", "", ft_stringw, contflags_edit | contflags_fieldedit},
+    {"Total revisions", "", ft_numeric_32, 0},
+    {"Total insertions", "", ft_numeric_32, 0},
+    {"Total deletions", "", ft_numeric_32, 0},
+    {"Total moves", "", ft_numeric_32, 0},
+    {"Total formatting changes", "", ft_numeric_32, 0},
 };
 
 bool IsProbablyXml(const char* name)
@@ -220,18 +222,89 @@ int MapChoiceTextToIndex(int fieldIndex, const char* text)
         if (strcmp(text, "Yes") == 0) return 0;
         if (strcmp(text, "No") == 0) return 1;
     }
-    else if (fieldIndex == FIELD_TCS_ON_OFF) {
-        if (strcmp(text, "Activated") == 0) return 0;
-        if (strcmp(text, "Deactivated") == 0) return 1;
+    else if (fieldIndex == FIELD_TRACK_CHANGES_ENABLED_DISABLED) {
+        if (strcmp(text, "Enabled") == 0) return 0;
+        if (strcmp(text, "Disabled") == 0) return 1;
     }
-    else if (fieldIndex == FIELD_ANONYMISED_FILES) {
+    else if (fieldIndex == FIELD_ANONYMISATION) {
         if (strcmp(text, "No") == 0) return 0;
-        if (strcmp(text, "Personal Information") == 0) return 1;
-        if (strcmp(text, "Date and Time") == 0) return 2;
-        if (strcmp(text, "Personal Information and Date and Time") == 0) return 3;
+        if (strcmp(text, "Personal information") == 0) return 1;
+        if (strcmp(text, "Date and time") == 0) return 2;
+        if (strcmp(text, "Personal information, Date and time") == 0) return 3;
     }
 
     return -1;
+}
+
+std::wstring GetPluginLngPath()
+{
+    HMODULE module = nullptr;
+    if (!GetModuleHandleExW(
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCWSTR>(&GetPluginLngPath),
+        &module)) {
+        return std::wstring();
+    }
+
+    wchar_t path[MAX_PATH] = {};
+    if (GetModuleFileNameW(module, path, MAX_PATH) == 0) {
+        return std::wstring();
+    }
+
+    std::wstring result = path;
+    size_t dot = result.find_last_of(L'.');
+    if (dot == std::wstring::npos) result += L".lng";
+    else {
+        result.erase(dot);
+        result += L".lng";
+    }
+    return result;
+}
+
+std::string ExtractLanguageCode(const std::string& value)
+{
+    if (value.empty()) return std::string();
+
+    std::string trimmed = value;
+    while (!trimmed.empty() && (trimmed.back() == '\r' || trimmed.back() == '\n' || trimmed.back() == ' ' || trimmed.back() == '\t')) {
+        trimmed.pop_back();
+    }
+
+    size_t slash = trimmed.find_last_of("\\/");
+    std::string tail = slash == std::string::npos ? trimmed : trimmed.substr(slash + 1);
+    size_t dot = tail.find_last_of('.');
+    if (dot != std::string::npos) tail.erase(dot);
+    size_t underscore = tail.find_last_of('_');
+    if (underscore != std::string::npos && underscore + 1 < tail.size()) tail = tail.substr(underscore + 1);
+
+    if (tail.size() >= 3 && tail.size() <= 8) {
+        for (char& ch : tail) ch = static_cast<char>(tolower(static_cast<unsigned char>(ch)));
+        return tail;
+    }
+
+    return std::string();
+}
+
+std::string DetectCurrentLanguageCode()
+{
+    if (g_defaultIniPath.empty()) return "eng";
+
+    const char* sections[] = { "Configuration", "International", "TC" };
+    const char* keys[] = { "LanguageIni", "Language", "Lang", "LanguageFile" };
+    char buffer[MAX_PATH] = {};
+
+    for (const char* section : sections) {
+        for (const char* key : keys) {
+            buffer[0] = '\0';
+            GetPrivateProfileStringA(section, key, "", buffer, static_cast<DWORD>(sizeof(buffer)), g_defaultIniPath.c_str());
+            if (buffer[0]) {
+                std::string code = ExtractLanguageCode(buffer);
+                if (!code.empty()) return code;
+            }
+        }
+    }
+
+    return "eng";
 }
 
 } // namespace
@@ -249,13 +322,13 @@ const char* GetMultipleChoiceText(int fieldIndex, int value)
     switch (fieldIndex) {
     case FIELD_AUTO_UPDATE_STYLES:
         return value == 0 ? "Yes" : "No";
-    case FIELD_TCS_ON_OFF:
-        return value == 0 ? "Activated" : "Deactivated";
-    case FIELD_ANONYMISED_FILES:
+    case FIELD_TRACK_CHANGES_ENABLED_DISABLED:
+        return value == 0 ? "Enabled" : "Disabled";
+    case FIELD_ANONYMISATION:
         switch (value) {
-        case 1: return "Personal Information";
-        case 2: return "Date and Time";
-        case 3: return "Personal Information and Date and Time";
+        case 1: return "Personal information";
+        case 2: return "Date and time";
+        case 3: return "Personal information, Date and time";
         default: return "No";
         }
     default:
@@ -289,6 +362,34 @@ void ClearCache()
 bool IsCanceled()
 {
     return g_cancelRequested.load(std::memory_order_relaxed);
+}
+
+void SetPluginDefaultIniPath(const std::string& iniPath)
+{
+    std::lock_guard<std::mutex> lock(g_languageMutex);
+    g_defaultIniPath = iniPath;
+}
+
+std::string TranslatePluginText(const std::string& englishText)
+{
+    if (englishText.empty()) return englishText;
+
+    std::wstring lngPath = GetPluginLngPath();
+    if (lngPath.empty()) return englishText;
+
+    std::string langCode;
+    {
+        std::lock_guard<std::mutex> lock(g_languageMutex);
+        langCode = DetectCurrentLanguageCode();
+    }
+
+    std::wstring section(langCode.begin(), langCode.end());
+    std::wstring key;
+    if (!Utf8ToWideString(englishText, key)) return englishText;
+
+    wchar_t translated[1024] = {};
+    GetPrivateProfileStringW(section.c_str(), key.c_str(), key.c_str(), translated, static_cast<DWORD>(std::size(translated)), lngPath.c_str());
+    return WideToUtf8(std::wstring(translated));
 }
 
 std::string FileTimeToIso8601UTC(const FILETIME* ftUtc)
@@ -946,21 +1047,21 @@ FieldResult GetFieldResult(const std::string& ansiPath, int fieldIndex, int /*un
     case FIELD_DOCUMENT_PROTECTION:
     {
         if (settingsXml.empty()) {
-            res.s = "No protection";
+            res.s = TranslatePluginText("No protection");
             res.type = FieldResult::StringUtf8;
             break;
         }
 
         tinyxml2::XMLDocument doc;
         if (doc.Parse(settingsXml.c_str()) != tinyxml2::XML_SUCCESS) {
-            res.s = "Error parsing settings.xml";
+            res.s = TranslatePluginText("Error parsing settings.xml");
             res.type = FieldResult::StringUtf8;
             break;
         }
 
         tinyxml2::XMLElement* root = doc.RootElement();
         if (!root) {
-            res.s = "No protection";
+            res.s = TranslatePluginText("No protection");
             res.type = FieldResult::StringUtf8;
             break;
         }
@@ -972,10 +1073,10 @@ FieldResult GetFieldResult(const std::string& ansiPath, int fieldIndex, int /*un
             if (enforcement && strcmp(enforcement, "1") == 0) {
                 const char* edit = protectionElem->Attribute("w:edit");
                 if (edit) {
-                    if (strcmp(edit, "readOnly") == 0) protectionType = "Read-Only";
-                    else if (strcmp(edit, "forms") == 0) protectionType = "Forms";
+                    if (strcmp(edit, "readOnly") == 0) protectionType = "Read-only";
+                    else if (strcmp(edit, "forms") == 0) protectionType = "Filling in forms";
                     else if (strcmp(edit, "comments") == 0) protectionType = "Comments";
-                    else if (strcmp(edit, "trackedChanges") == 0) protectionType = "Tracked Changes";
+                    else if (strcmp(edit, "trackedChanges") == 0) protectionType = "Tracked changes";
                     else protectionType = "Unknown protection type";
                 }
                 else {
@@ -984,7 +1085,7 @@ FieldResult GetFieldResult(const std::string& ansiPath, int fieldIndex, int /*un
             }
         }
 
-        res.s = protectionType;
+        res.s = TranslatePluginText(protectionType);
         res.type = FieldResult::StringUtf8;
         break;
     }
@@ -992,7 +1093,7 @@ FieldResult GetFieldResult(const std::string& ansiPath, int fieldIndex, int /*un
         res.i32 = IsAutoUpdateStylesEnabled(settingsXml) ? 0 : 1;
         res.type = FieldResult::Int32;
         break;
-    case FIELD_ANONYMISED_FILES:
+    case FIELD_ANONYMISATION:
         res.i32 = GetAnonymisedFlags(settingsXml);
         res.type = FieldResult::Int32;
         break;
@@ -1000,7 +1101,7 @@ FieldResult GetFieldResult(const std::string& ansiPath, int fieldIndex, int /*un
         res.b = HasTrackedChanges(ansiPath.c_str());
         res.type = FieldResult::Boolean;
         break;
-    case FIELD_TCS_ON_OFF:
+    case FIELD_TRACK_CHANGES_ENABLED_DISABLED:
         res.i32 = IsTrackChangesEnabled(settingsXml) ? 0 : 1;
         res.type = FieldResult::Int32;
         break;
@@ -1072,9 +1173,9 @@ const char* GetIndirectAnsiChoiceText(const void* fieldValue)
     const char* direct = static_cast<const char*>(fieldValue);
     if (direct[0] != '\0') {
         if (strcmp(direct, "Yes") == 0 || strcmp(direct, "No") == 0 ||
-            strcmp(direct, "Activated") == 0 || strcmp(direct, "Deactivated") == 0 ||
-            strcmp(direct, "Personal Information") == 0 || strcmp(direct, "Date and Time") == 0 ||
-            strcmp(direct, "Personal Information and Date and Time") == 0) {
+            strcmp(direct, "Enabled") == 0 || strcmp(direct, "Disabled") == 0 ||
+            strcmp(direct, "Personal information") == 0 || strcmp(direct, "Date and time") == 0 ||
+            strcmp(direct, "Personal information, Date and time") == 0) {
             return direct;
         }
     }
@@ -1118,7 +1219,7 @@ int GetContentValueWInternal(const std::string& ansiPath, int fieldIndex, int un
         }
         return ft_fieldempty;
     case FieldResult::Int32:
-        if (fieldIndex == FIELD_AUTO_UPDATE_STYLES || fieldIndex == FIELD_ANONYMISED_FILES || fieldIndex == FIELD_TCS_ON_OFF) {
+        if (fieldIndex == FIELD_AUTO_UPDATE_STYLES || fieldIndex == FIELD_ANONYMISATION || fieldIndex == FIELD_TRACK_CHANGES_ENABLED_DISABLED) {
             const char* choiceText = GetMultipleChoiceText(fieldIndex, r.i32);
             strncpy_s(static_cast<char*>(fieldValue), static_cast<size_t>(maxLen), choiceText, _TRUNCATE);
             return ft_multiplechoice;
@@ -1158,7 +1259,7 @@ int GetContentValueInternal(const std::string& ansiPath, int fieldIndex, int uni
         if (FormatSystemTimeToAnsi(r.ft, unitIndex, static_cast<char*>(fieldValue), maxLen)) return ft_string;
         return ft_fieldempty;
     case FieldResult::Int32:
-        if (fieldIndex == FIELD_AUTO_UPDATE_STYLES || fieldIndex == FIELD_ANONYMISED_FILES || fieldIndex == FIELD_TCS_ON_OFF) {
+        if (fieldIndex == FIELD_AUTO_UPDATE_STYLES || fieldIndex == FIELD_ANONYMISATION || fieldIndex == FIELD_TRACK_CHANGES_ENABLED_DISABLED) {
             const char* choiceText = GetMultipleChoiceText(fieldIndex, r.i32);
             strncpy_s(static_cast<char*>(fieldValue), static_cast<size_t>(maxLen), choiceText, _TRUNCATE);
             return ft_multiplechoice;

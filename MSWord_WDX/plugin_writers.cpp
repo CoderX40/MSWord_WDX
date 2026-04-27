@@ -2,10 +2,84 @@
 
 #include "plugin_shared.h"
 
+#include <algorithm>
 #include <functional>
 #include <map>
+#include <vector>
 
 namespace {
+
+std::vector<std::wstring> SplitLines(const std::wstring& text)
+{
+    std::vector<std::wstring> lines;
+    std::wstring current;
+    for (wchar_t ch : text) {
+        if (ch == L'\r') {
+            continue;
+        }
+        if (ch == L'\n') {
+            lines.push_back(current);
+            current.clear();
+            continue;
+        }
+        current.push_back(ch);
+    }
+    lines.push_back(current);
+    return lines;
+}
+
+std::vector<std::wstring> SplitTabs(const std::wstring& text)
+{
+    std::vector<std::wstring> parts;
+    std::wstring current;
+    for (wchar_t ch : text) {
+        if (ch == L'\t') {
+            parts.push_back(current);
+            current.clear();
+            continue;
+        }
+        current.push_back(ch);
+    }
+    parts.push_back(current);
+    return parts;
+}
+
+void ParseAuthorRenamePayload(const std::wstring& encoded, std::vector<AuthorRenameEntry>& renames, std::string& replaceRemainingWith)
+{
+    renames.clear();
+    replaceRemainingWith.clear();
+
+    if (encoded.find(L"PAIR\t") == std::wstring::npos && encoded.find(L"ALL\t") == std::wstring::npos) {
+        size_t sep = encoded.find(L'|');
+        if (sep == std::wstring::npos) {
+            std::string newName = WideToUtf8(encoded);
+            if (!newName.empty()) {
+                replaceRemainingWith = newName;
+            }
+            return;
+        }
+
+        renames.push_back({ WideToUtf8(encoded.substr(0, sep)), WideToUtf8(encoded.substr(sep + 1)) });
+        return;
+    }
+
+    for (const std::wstring& line : SplitLines(encoded)) {
+        if (line.empty()) continue;
+        std::vector<std::wstring> parts = SplitTabs(line);
+        if (parts.empty()) continue;
+
+        if (parts[0] == L"PAIR" && parts.size() >= 3) {
+            std::string oldAuthor = WideToUtf8(parts[1]);
+            std::string newAuthor = WideToUtf8(parts[2]);
+            if (!oldAuthor.empty() && !newAuthor.empty()) {
+                renames.push_back({ oldAuthor, newAuthor });
+            }
+        }
+        else if (parts[0] == L"ALL" && parts.size() >= 2) {
+            replaceRemainingWith = WideToUtf8(parts[1]);
+        }
+    }
+}
 
 bool SaveReplacementsToDocx(const std::string& path, const std::map<std::string, std::string>& replacements)
 {
@@ -221,10 +295,18 @@ bool SaveXmlToZip(const char* zipPath, const char* fileNameInZip, const std::str
 
 bool RenameTrackedChangeAuthors(const std::string& ansiPath, const std::string& oldAuthor, const std::string& newAuthor)
 {
+    std::vector<AuthorRenameEntry> renames;
+    renames.push_back({ oldAuthor, newAuthor });
+    return RenameTrackedChangeAuthorsBatch(ansiPath, renames, std::string());
+}
+
+bool RenameTrackedChangeAuthorsBatch(const std::string& ansiPath, const std::vector<AuthorRenameEntry>& renames, const std::string& replaceRemainingWith)
+{
     mz_zip_archive reader{};
     if (!mz_zip_reader_init_file(&reader, ansiPath.c_str(), 0)) return false;
 
     std::map<std::string, std::string> replacements;
+    bool hasReplaceRemaining = !replaceRemainingWith.empty();
     mz_uint numFiles = mz_zip_reader_get_num_files(&reader);
     for (mz_uint i = 0; i < numFiles; ++i) {
         mz_zip_archive_file_stat stat;
@@ -248,8 +330,23 @@ bool RenameTrackedChangeAuthors(const std::string& ansiPath, const std::string& 
             for (const char* attr : { "w:author", "w:originalAuthor" }) {
                 const char* val = elem->Attribute(attr);
                 if (!val) continue;
-                if (oldAuthor.empty() || oldAuthor == val) {
-                    elem->SetAttribute(attr, newAuthor.c_str());
+
+                const AuthorRenameEntry* matchedRename = nullptr;
+                for (const AuthorRenameEntry& rename : renames) {
+                    if (rename.oldAuthor == val) {
+                        matchedRename = &rename;
+                        break;
+                    }
+                }
+
+                if (matchedRename) {
+                    if (matchedRename->newAuthor != val) {
+                        elem->SetAttribute(attr, matchedRename->newAuthor.c_str());
+                        modified = true;
+                    }
+                }
+                else if (hasReplaceRemaining && replaceRemainingWith != val) {
+                    elem->SetAttribute(attr, replaceRemainingWith.c_str());
                     modified = true;
                 }
             }
@@ -435,11 +532,11 @@ int RunContentSetValueW(WCHAR* fileName, int fieldIndex, int unitIndex, int fiel
         DbgLog("FIELD_AUTO_UPDATE_STYLES: idx=%d enable=%d saved=%d\n", idx, static_cast<int>(enable), static_cast<int>(saved));
         return saved ? ft_setsuccess : ft_fileerror;
     }
-    case FIELD_ANONYMISED_FILES:
+    case FIELD_ANONYMISATION:
     {
         if (!fieldValue) return ft_fieldempty;
         const char* choiceText = GetIndirectAnsiChoiceText(fieldValue);
-        DbgLog("FIELD_ANONYMISED_FILES: fieldValue=%p nestedChoice=%s\n", fieldValue, choiceText ? choiceText : "(null)");
+        DbgLog("FIELD_ANONYMISATION: fieldValue=%p nestedChoice=%s\n", fieldValue, choiceText ? choiceText : "(null)");
         int idx = NormalizeChoiceIndex(fieldIndex, fieldValue, 4);
         if (idx < 0) return ft_fieldempty;
 
@@ -469,14 +566,14 @@ int RunContentSetValueW(WCHAR* fileName, int fieldIndex, int unitIndex, int fiel
             return true;
         });
 
-        DbgLog("FIELD_ANONYMISED_FILES: idx=%d removePI=%d removeDate=%d saved=%d\n", idx, static_cast<int>(removePI), static_cast<int>(removeDate), static_cast<int>(saved));
+        DbgLog("FIELD_ANONYMISATION: idx=%d removePI=%d removeDate=%d saved=%d\n", idx, static_cast<int>(removePI), static_cast<int>(removeDate), static_cast<int>(saved));
         return saved ? ft_setsuccess : ft_fileerror;
     }
-    case FIELD_TCS_ON_OFF:
+    case FIELD_TRACK_CHANGES_ENABLED_DISABLED:
     {
         if (!fieldValue) return ft_fieldempty;
         const char* choiceText = GetIndirectAnsiChoiceText(fieldValue);
-        DbgLog("FIELD_TCS_ON_OFF: fieldValue=%p nestedChoice=%s\n", fieldValue, choiceText ? choiceText : "(null)");
+        DbgLog("FIELD_TRACK_CHANGES_ENABLED_DISABLED: fieldValue=%p nestedChoice=%s\n", fieldValue, choiceText ? choiceText : "(null)");
         int idx = NormalizeChoiceIndex(fieldIndex, fieldValue, 2);
         if (idx < 0) return ft_fieldempty;
         bool enable = idx == 0;
@@ -496,7 +593,7 @@ int RunContentSetValueW(WCHAR* fileName, int fieldIndex, int unitIndex, int fiel
             return true;
         });
 
-        DbgLog("FIELD_TCS_ON_OFF: idx=%d enable=%d saved=%d\n", idx, static_cast<int>(enable), static_cast<int>(saved));
+        DbgLog("FIELD_TRACK_CHANGES_ENABLED_DISABLED: idx=%d enable=%d saved=%d\n", idx, static_cast<int>(enable), static_cast<int>(saved));
         return saved ? ft_setsuccess : ft_fileerror;
     }
     case FIELD_DOCUMENT_PROTECTION:
@@ -522,10 +619,10 @@ int RunContentSetValueW(WCHAR* fileName, int fieldIndex, int unitIndex, int fiel
             if (mode == "No protection") return true;
 
             const char* editVal =
-                mode == "Read-Only" ? "readOnly" :
-                mode == "Forms" ? "forms" :
+                mode == "Read-only" ? "readOnly" :
+                mode == "Filling in forms" ? "forms" :
                 mode == "Comments" ? "comments" :
-                mode == "Tracked Changes" ? "trackedChanges" : nullptr;
+                mode == "Tracked changes" ? "trackedChanges" : nullptr;
             if (!editVal) return false;
 
             prot = doc.NewElement("w:documentProtection");
@@ -567,19 +664,16 @@ int RunContentSetValueW(WCHAR* fileName, int fieldIndex, int unitIndex, int fiel
     {
         if (!fieldValue) return ft_fieldempty;
         std::wstring encoded(static_cast<const wchar_t*>(fieldValue));
-        std::string oldName;
-        std::string newName;
-        size_t sep = encoded.find(L'|');
-        if (sep == std::wstring::npos) {
-            newName = WideToUtf8(encoded);
-        }
-        else {
-            oldName = WideToUtf8(encoded.substr(0, sep));
-            newName = WideToUtf8(encoded.substr(sep + 1));
-        }
+        std::vector<AuthorRenameEntry> renames;
+        std::string replaceRemainingWith;
+        ParseAuthorRenamePayload(encoded, renames, replaceRemainingWith);
 
-        if (newName.empty()) return ft_fieldempty;
-        return RenameTrackedChangeAuthors(ansiPath, oldName, newName) ? ft_setsuccess : ft_fileerror;
+        bool hasUsefulSpecificRename = std::any_of(renames.begin(), renames.end(), [](const AuthorRenameEntry& rename) {
+            return !rename.oldAuthor.empty() && !rename.newAuthor.empty();
+        });
+
+        if (!hasUsefulSpecificRename && replaceRemainingWith.empty()) return ft_fieldempty;
+        return RenameTrackedChangeAuthorsBatch(ansiPath, renames, replaceRemainingWith) ? ft_setsuccess : ft_fileerror;
     }
     default:
         return ft_notsupported;

@@ -7,6 +7,7 @@
 #pragma comment(linker, "/export:ContentGetValue=_ContentGetValue@24")
 #pragma comment(linker, "/export:ContentGetValueW=_ContentGetValueW@24")
 #pragma comment(linker, "/export:ContentGetSupportedFieldFlags=_ContentGetSupportedFieldFlags@4")
+#pragma comment(linker, "/export:ContentGetDefaultSortOrder=_ContentGetDefaultSortOrder@4")
 #pragma comment(linker, "/export:ContentSetValue=_ContentSetValue@24")
 #pragma comment(linker, "/export:ContentSetValueW=_ContentSetValueW@24")
 #pragma comment(linker, "/export:ContentEditValue=_ContentEditValue@32")
@@ -15,40 +16,19 @@
 
 namespace {
 
-wchar_t* SafeGetIniPath(void* dparm)
+struct ContentDefaultParamStruct {
+    int size;
+    DWORD PluginInterfaceVersionLow;
+    DWORD PluginInterfaceVersionHi;
+    char DefaultIniName[MAX_PATH];
+};
+
+const char* SafeGetIniPathAnsi(void* dparm)
 {
     if (!dparm) return nullptr;
-
-#if defined(_MSC_VER)
-    __try {
-        void* pRaw = nullptr;
-        memcpy(&pRaw, reinterpret_cast<char*>(dparm) + sizeof(void*), sizeof(void*));
-        if (!pRaw) return nullptr;
-
-        wchar_t* pw = static_cast<wchar_t*>(pRaw);
-        size_t maxCheck = 4096;
-        size_t len = 0;
-        __try {
-            for (; len < maxCheck; ++len) {
-                if (pw[len] == L'\0') break;
-            }
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER) {
-            return nullptr;
-        }
-        if (len == maxCheck) return nullptr;
-        return pw;
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        return nullptr;
-    }
-#else
-    void* pRaw = nullptr;
-    memcpy(&pRaw, reinterpret_cast<char*>(dparm) + sizeof(void*), sizeof(void*));
-    if (!pRaw) return nullptr;
-    wchar_t* pw = static_cast<wchar_t*>(pRaw);
-    return pw[0] == L'\0' ? nullptr : pw;
-#endif
+    const ContentDefaultParamStruct* dps = static_cast<const ContentDefaultParamStruct*>(dparm);
+    if (dps->size < static_cast<int>(offsetof(ContentDefaultParamStruct, DefaultIniName) + 1)) return nullptr;
+    return dps->DefaultIniName[0] ? dps->DefaultIniName : nullptr;
 }
 
 } // namespace
@@ -107,9 +87,8 @@ __declspec(dllexport) int __stdcall ContentGetDetectStringW(WCHAR* DetectString,
 __declspec(dllexport) void __stdcall ContentSetDefaultParams(void* dparm)
 {
     if (!dparm) return;
-    wchar_t* pIniPath = SafeGetIniPath(dparm);
-    if (pIniPath) {
-    }
+    const char* pIniPath = SafeGetIniPathAnsi(dparm);
+    if (pIniPath) SetPluginDefaultIniPath(pIniPath);
 }
 
 __declspec(dllexport) void __stdcall ContentStopGetValue(void)
@@ -130,6 +109,31 @@ __declspec(dllexport) int __stdcall ContentGetSupportedFieldFlags(int fieldIndex
 
     const FieldDescriptor* descriptor = GetFieldDescriptor(fieldIndex);
     return descriptor ? descriptor->flags : 0;
+}
+
+__declspec(dllexport) int __stdcall ContentGetDefaultSortOrder(int fieldIndex)
+{
+    switch (fieldIndex) {
+    case FIELD_CORE_CREATED_DATE:
+    case FIELD_CORE_MODIFIED_DATE:
+    case FIELD_CORE_LAST_PRINTED_DATE:
+    case FIELD_CORE_REVISION_NUMBER:
+    case FIELD_APP_EDITING_TIME:
+    case FIELD_APP_PAGES:
+    case FIELD_APP_PARAGRAPHS:
+    case FIELD_APP_LINES:
+    case FIELD_APP_WORDS:
+    case FIELD_APP_CHARACTERS:
+    case FIELD_COMMENTS:
+    case FIELD_TOTAL_REVISIONS:
+    case FIELD_TOTAL_INSERTIONS:
+    case FIELD_TOTAL_DELETIONS:
+    case FIELD_TOTAL_MOVES:
+    case FIELD_TOTAL_FORMATTING_CHANGES:
+        return -1;
+    default:
+        return 1;
+    }
 }
 
 __declspec(dllexport) void __stdcall ContentPluginUnloading(void)

@@ -154,6 +154,11 @@
     <ClInclude Include="plugin_shared.h" />
   </ItemGroup>
   <ItemGroup>
+    <None Include="MSWord_WDX.lng">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+  <ItemGroup>
     <ClCompile Include="dllmain.cpp">
       <RuntimeLibrary Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">MultiThreaded</RuntimeLibrary>
     </ClCompile>

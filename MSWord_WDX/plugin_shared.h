@@ -9,6 +9,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <vector>
 
 #include "miniz.h"
 #include "tinyxml2.h"
@@ -74,9 +75,9 @@ enum FieldIndex {
     FIELD_COMMENTS,
     FIELD_DOCUMENT_PROTECTION,
     FIELD_AUTO_UPDATE_STYLES,
-    FIELD_ANONYMISED_FILES,
+    FIELD_ANONYMISATION,
     FIELD_TRACKED_CHANGES,
-    FIELD_TCS_ON_OFF,
+    FIELD_TRACK_CHANGES_ENABLED_DISABLED,
     FIELD_AUTHORS,
     FIELD_TOTAL_REVISIONS,
     FIELD_TOTAL_INSERTIONS,
@@ -120,6 +121,11 @@ struct FieldDescriptor {
     int flags;
 };
 
+struct AuthorRenameEntry {
+    std::string oldAuthor;
+    std::string newAuthor;
+};
+
 extern std::atomic<bool> g_cancelRequested;
 
 const FieldDescriptor* GetFieldDescriptor(int fieldIndex);
@@ -154,6 +160,8 @@ FieldResult GetFieldResult(const std::string& ansiPath, int fieldIndex, int unit
 void DbgLog(const char* fmt, ...);
 int NormalizeChoiceIndex(int fieldIndex, const void* fieldValue, int choiceCount);
 const char* GetIndirectAnsiChoiceText(const void* fieldValue);
+void SetPluginDefaultIniPath(const std::string& iniPath);
+std::string TranslatePluginText(const std::string& englishText);
 
 int GetContentValueWInternal(const std::string& ansiPath, int fieldIndex, int unitIndex, void* fieldValue, int maxLen);
 int GetContentValueInternal(const std::string& ansiPath, int fieldIndex, int unitIndex, void* fieldValue, int maxLen);
@@ -161,6 +169,7 @@ int GetContentValueInternal(const std::string& ansiPath, int fieldIndex, int uni
 bool SetXmlStringValue(std::string& xmlContent, const char* elementName, const std::string& value);
 bool SaveXmlToZip(const char* zipPath, const char* fileNameInZip, const std::string& content);
 bool RenameTrackedChangeAuthors(const std::string& ansiPath, const std::string& oldAuthor, const std::string& newAuthor);
+bool RenameTrackedChangeAuthorsBatch(const std::string& ansiPath, const std::vector<AuthorRenameEntry>& renames, const std::string& replaceRemainingWith);
 
 int RunContentSetValueW(WCHAR* fileName, int fieldIndex, int unitIndex, int fieldType, void* fieldValue, int flags);
 int RunContentSetValue(char* fileName, int fieldIndex, int unitIndex, int fieldType, void* fieldValue, int flags);
