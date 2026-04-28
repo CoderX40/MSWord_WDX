@@ -59,7 +59,14 @@ void ParseAuthorRenamePayload(const std::wstring& encoded, std::vector<AuthorRen
             return;
         }
 
-        renames.push_back({ WideToUtf8(encoded.substr(0, sep)), WideToUtf8(encoded.substr(sep + 1)) });
+        std::string oldAuthor = WideToUtf8(encoded.substr(0, sep));
+        std::string newAuthor = WideToUtf8(encoded.substr(sep + 1));
+        if (oldAuthor.empty()) {
+            replaceRemainingWith = newAuthor;
+        }
+        else if (!newAuthor.empty()) {
+            renames.push_back({ oldAuthor, newAuthor });
+        }
         return;
     }
 
