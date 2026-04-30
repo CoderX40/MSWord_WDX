@@ -94,6 +94,33 @@ struct CachedParts {
     std::string commentsXml;
     std::string settingsXml;
     std::string documentXml;
+    bool derivedReady = false;
+    std::string coreTitle;
+    std::string coreSubject;
+    std::string coreCreator;
+    std::string appManager;
+    std::string appCompany;
+    std::string coreKeywords;
+    std::string coreDescription;
+    std::string appHyperlinkBase;
+    std::string appTemplate;
+    std::string coreCreated;
+    std::string coreModified;
+    std::string coreLastPrinted;
+    std::string coreLastModifiedBy;
+    int coreRevision = 0;
+    int appEditingTime = 0;
+    int appPages = 0;
+    int appParagraphs = 0;
+    int appLines = 0;
+    int appWords = 0;
+    int appCharacters = 0;
+    bool compatibilityMode = false;
+    bool autoUpdateStyles = false;
+    int anonymisationFlags = 0;
+    bool trackChangesEnabled = false;
+    int commentsCount = 0;
+    bool hiddenText = false;
 };
 
 struct TrackedChangeCounts {

@@ -11,6 +11,9 @@
 #include <sstream>
 #include <vector>
 
+bool HasHiddenTextInDocumentXmlContent(const std::string& xmlContent);
+void PopulateDerivedCachedParts(CachedParts& parts);
+
 namespace {
 
 std::mutex g_cacheMutex;
@@ -533,6 +536,7 @@ bool EnsureCachedParts(const std::string& ansiPath)
     ExtractFileFromZip(ansiPath.c_str(), "word/comments.xml", g_cachedParts.commentsXml);
     ExtractFileFromZip(ansiPath.c_str(), "word/settings.xml", g_cachedParts.settingsXml);
     ExtractFileFromZip(ansiPath.c_str(), "word/document.xml", g_cachedParts.documentXml);
+    PopulateDerivedCachedParts(g_cachedParts);
 
     g_cachedParts.path = ansiPath;
     return true;
@@ -643,6 +647,13 @@ bool ExtractFileFromZip(const char* zipPath, const char* fileNameInZip, std::str
         if (!IsValidUtf8(output)) {
             std::string converted = AnsiToUtf8(output);
             if (!converted.empty()) output.swap(converted);
+        }
+
+        if (output.size() >= 3 &&
+            static_cast<unsigned char>(output[0]) == 0xEF &&
+            static_cast<unsigned char>(output[1]) == 0xBB &&
+            static_cast<unsigned char>(output[2]) == 0xBF) {
+            output.erase(0, 3);
         }
 
         if (output.rfind("<?xml", 0) != 0) {
@@ -831,6 +842,37 @@ int CountComments(const std::string& xmlContent)
     return count;
 }
 
+void PopulateDerivedCachedParts(CachedParts& parts)
+{
+    parts.coreTitle = GetXmlStringValue(parts.coreXml, "dc:title");
+    parts.coreSubject = GetXmlStringValue(parts.coreXml, "dc:subject");
+    parts.coreCreator = GetXmlStringValue(parts.coreXml, "dc:creator");
+    parts.appManager = GetXmlStringValue(parts.appXml, "Manager");
+    parts.appCompany = GetXmlStringValue(parts.appXml, "Company");
+    parts.coreKeywords = GetXmlStringValue(parts.coreXml, "cp:keywords");
+    parts.coreDescription = GetXmlStringValue(parts.coreXml, "dc:description");
+    parts.appHyperlinkBase = GetXmlStringValue(parts.appXml, "HyperlinkBase");
+    parts.appTemplate = GetXmlStringValue(parts.appXml, "Template");
+    parts.coreCreated = GetXmlStringValue(parts.coreXml, "dcterms:created");
+    parts.coreModified = GetXmlStringValue(parts.coreXml, "dcterms:modified");
+    parts.coreLastPrinted = GetXmlStringValue(parts.coreXml, "cp:lastPrinted");
+    parts.coreLastModifiedBy = GetXmlStringValue(parts.coreXml, "cp:lastModifiedBy");
+    parts.coreRevision = GetXmlIntValue(parts.coreXml, "cp:revision");
+    parts.appEditingTime = GetXmlIntValue(parts.appXml, "TotalTime");
+    parts.appPages = GetXmlIntValue(parts.appXml, "Pages");
+    parts.appParagraphs = GetXmlIntValue(parts.appXml, "Paragraphs");
+    parts.appLines = GetXmlIntValue(parts.appXml, "Lines");
+    parts.appWords = GetXmlIntValue(parts.appXml, "Words");
+    parts.appCharacters = GetXmlIntValue(parts.appXml, "Characters");
+    parts.compatibilityMode = IsCompatibilityModeEnabled(parts.settingsXml);
+    parts.autoUpdateStyles = IsAutoUpdateStylesEnabled(parts.settingsXml);
+    parts.anonymisationFlags = GetAnonymisedFlags(parts.settingsXml);
+    parts.trackChangesEnabled = IsTrackChangesEnabled(parts.settingsXml);
+    parts.commentsCount = CountComments(parts.commentsXml);
+    parts.hiddenText = HasHiddenTextInDocumentXmlContent(parts.documentXml);
+    parts.derivedReady = true;
+}
+
 bool IsTrackChangesEnabled(const std::string& settingsXmlContent)
 {
     tinyxml2::XMLDocument doc;
@@ -871,26 +913,14 @@ int GetAnonymisedFlags(const std::string& settingsXmlContent)
 
 bool HasHiddenTextInDocumentXml(const char* zipPath)
 {
-    mz_zip_archive zipArchive{};
-    if (!mz_zip_reader_init_file(&zipArchive, zipPath, 0)) return false;
+    std::string xmlContent;
+    if (!ExtractFileFromZip(zipPath, "word/document.xml", xmlContent)) return false;
+    return HasHiddenTextInDocumentXmlContent(xmlContent);
+}
 
-    int fileIndex = mz_zip_reader_locate_file(&zipArchive, "word/document.xml", nullptr, 0);
-    if (fileIndex < 0) {
-        mz_zip_reader_end(&zipArchive);
-        return false;
-    }
-
-    size_t uncompressedSize = 0;
-    void* p = mz_zip_reader_extract_to_heap(&zipArchive, fileIndex, &uncompressedSize, 0);
-    if (!p) {
-        mz_zip_reader_end(&zipArchive);
-        return false;
-    }
-
-    std::string xmlContent(static_cast<char*>(p), uncompressedSize);
-    mz_free(p);
-    mz_zip_reader_end(&zipArchive);
-
+bool HasHiddenTextInDocumentXmlContent(const std::string& xmlContent)
+{
+    if (xmlContent.empty()) return false;
     tinyxml2::XMLDocument doc;
     if (doc.Parse(xmlContent.c_str()) != tinyxml2::XML_SUCCESS) return false;
 
@@ -941,30 +971,76 @@ bool IsCompatibilityModeEnabled(const std::string& settingsXmlContent)
     return false;
 }
 
+namespace {
+
+std::string StripUtf8Bom(const std::string& xmlContent)
+{
+    if (xmlContent.size() >= 3 &&
+        static_cast<unsigned char>(xmlContent[0]) == 0xEF &&
+        static_cast<unsigned char>(xmlContent[1]) == 0xBB &&
+        static_cast<unsigned char>(xmlContent[2]) == 0xBF) {
+        return xmlContent.substr(3);
+    }
+    return xmlContent;
+}
+
+tinyxml2::XMLElement* FindElementByNameRecursive(tinyxml2::XMLElement* element, const char* elementName)
+{
+    if (!element || !elementName) return nullptr;
+
+    if (const char* currentName = element->Name()) {
+        if (strcmp(currentName, elementName) == 0) {
+            return element;
+        }
+    }
+
+    for (tinyxml2::XMLElement* child = element->FirstChildElement(); child; child = child->NextSiblingElement()) {
+        if (tinyxml2::XMLElement* match = FindElementByNameRecursive(child, elementName)) {
+            return match;
+        }
+    }
+
+    return nullptr;
+}
+
+tinyxml2::XMLElement* FindXmlElement(tinyxml2::XMLDocument& doc, const char* elementName)
+{
+    tinyxml2::XMLElement* root = doc.RootElement();
+    if (!root) return nullptr;
+
+    if (tinyxml2::XMLElement* directChild = root->FirstChildElement(elementName)) {
+        return directChild;
+    }
+
+    return FindElementByNameRecursive(root, elementName);
+}
+
+bool ParseXmlDocument(const std::string& xmlContent, tinyxml2::XMLDocument& doc)
+{
+    if (xmlContent.empty()) return false;
+
+    std::string normalized = StripUtf8Bom(xmlContent);
+    return doc.Parse(normalized.c_str(), normalized.size()) == tinyxml2::XML_SUCCESS;
+}
+
+} // namespace
+
 std::string GetXmlStringValue(const std::string& xmlContent, const char* elementName)
 {
-    if (xmlContent.empty()) return std::string();
     tinyxml2::XMLDocument doc;
-    if (doc.Parse(xmlContent.c_str()) != tinyxml2::XML_SUCCESS) return std::string();
+    if (!ParseXmlDocument(xmlContent, doc)) return std::string();
 
-    tinyxml2::XMLElement* root = doc.RootElement();
-    if (!root) return std::string();
-
-    tinyxml2::XMLElement* element = root->FirstChildElement(elementName);
+    tinyxml2::XMLElement* element = FindXmlElement(doc, elementName);
     if (element && element->GetText()) return element->GetText();
     return std::string();
 }
 
 int GetXmlIntValue(const std::string& xmlContent, const char* elementName)
 {
-    if (xmlContent.empty()) return 0;
     tinyxml2::XMLDocument doc;
-    if (doc.Parse(xmlContent.c_str()) != tinyxml2::XML_SUCCESS) return 0;
+    if (!ParseXmlDocument(xmlContent, doc)) return 0;
 
-    tinyxml2::XMLElement* root = doc.RootElement();
-    if (!root) return 0;
-
-    tinyxml2::XMLElement* element = root->FirstChildElement(elementName);
+    tinyxml2::XMLElement* element = FindXmlElement(doc, elementName);
     if (!element) return 0;
 
     int value = 0;
@@ -1137,19 +1213,11 @@ FieldResult GetFieldResult(const std::string& ansiPath, int fieldIndex, int /*un
 
     EnsureCachedParts(ansiPath);
 
-    std::string coreXml;
-    std::string appXml;
-    std::string commentsXml;
-    std::string settingsXml;
-    std::string documentXml;
+    CachedParts cachedParts;
 
     {
         std::lock_guard<std::mutex> lock(g_cacheMutex);
-        coreXml = g_cachedParts.coreXml;
-        appXml = g_cachedParts.appXml;
-        commentsXml = g_cachedParts.commentsXml;
-        settingsXml = g_cachedParts.settingsXml;
-        documentXml = g_cachedParts.documentXml;
+        cachedParts = g_cachedParts;
     }
 
     TrackedChangeCounts trackedCounts;
@@ -1160,39 +1228,39 @@ FieldResult GetFieldResult(const std::string& ansiPath, int fieldIndex, int /*un
 
     switch (fieldIndex) {
     case FIELD_CORE_TITLE:
-        res.s = GetXmlStringValue(coreXml, "dc:title");
+        res.s = cachedParts.coreTitle;
         res.type = res.s.empty() ? FieldResult::Empty : FieldResult::StringUtf8;
         break;
     case FIELD_CORE_SUBJECT:
-        res.s = GetXmlStringValue(coreXml, "dc:subject");
+        res.s = cachedParts.coreSubject;
         res.type = res.s.empty() ? FieldResult::Empty : FieldResult::StringUtf8;
         break;
     case FIELD_CORE_CREATOR:
-        res.s = GetXmlStringValue(coreXml, "dc:creator");
+        res.s = cachedParts.coreCreator;
         res.type = res.s.empty() ? FieldResult::Empty : FieldResult::StringUtf8;
         break;
     case FIELD_APP_MANAGER:
-        res.s = GetXmlStringValue(appXml, "Manager");
+        res.s = cachedParts.appManager;
         res.type = res.s.empty() ? FieldResult::Empty : FieldResult::StringUtf8;
         break;
     case FIELD_APP_COMPANY:
-        res.s = GetXmlStringValue(appXml, "Company");
+        res.s = cachedParts.appCompany;
         res.type = res.s.empty() ? FieldResult::Empty : FieldResult::StringUtf8;
         break;
     case FIELD_CORE_KEYWORDS:
-        res.s = GetXmlStringValue(coreXml, "cp:keywords");
+        res.s = cachedParts.coreKeywords;
         res.type = res.s.empty() ? FieldResult::Empty : FieldResult::StringUtf8;
         break;
     case FIELD_CORE_DESCRIPTION:
-        res.s = GetXmlStringValue(coreXml, "dc:description");
+        res.s = cachedParts.coreDescription;
         res.type = res.s.empty() ? FieldResult::Empty : FieldResult::StringUtf8;
         break;
     case FIELD_APP_HYPERLINK_BASE:
-        res.s = GetXmlStringValue(appXml, "HyperlinkBase");
+        res.s = cachedParts.appHyperlinkBase;
         res.type = res.s.empty() ? FieldResult::Empty : FieldResult::StringUtf8;
         break;
     case FIELD_APP_TEMPLATE:
-        res.s = GetXmlStringValue(appXml, "Template");
+        res.s = cachedParts.appTemplate;
         res.type = res.s.empty() ? FieldResult::Empty : FieldResult::StringUtf8;
         break;
     case FIELD_CORE_CREATED_DATE:
@@ -1200,9 +1268,9 @@ FieldResult GetFieldResult(const std::string& ansiPath, int fieldIndex, int /*un
     case FIELD_CORE_LAST_PRINTED_DATE:
     {
         std::string dateStr;
-        if (fieldIndex == FIELD_CORE_CREATED_DATE) dateStr = GetXmlStringValue(coreXml, "dcterms:created");
-        else if (fieldIndex == FIELD_CORE_MODIFIED_DATE) dateStr = GetXmlStringValue(coreXml, "dcterms:modified");
-        else dateStr = GetXmlStringValue(coreXml, "cp:lastPrinted");
+        if (fieldIndex == FIELD_CORE_CREATED_DATE) dateStr = cachedParts.coreCreated;
+        else if (fieldIndex == FIELD_CORE_MODIFIED_DATE) dateStr = cachedParts.coreModified;
+        else dateStr = cachedParts.coreLastPrinted;
 
         if (dateStr.empty()) break;
 
@@ -1214,59 +1282,59 @@ FieldResult GetFieldResult(const std::string& ansiPath, int fieldIndex, int /*un
         break;
     }
     case FIELD_CORE_LAST_MODIFIED_BY:
-        res.s = GetXmlStringValue(coreXml, "cp:lastModifiedBy");
+        res.s = cachedParts.coreLastModifiedBy;
         res.type = res.s.empty() ? FieldResult::Empty : FieldResult::StringUtf8;
         break;
     case FIELD_CORE_REVISION_NUMBER:
-        res.i32 = GetXmlIntValue(coreXml, "cp:revision");
+        res.i32 = cachedParts.coreRevision;
         res.type = FieldResult::Int32;
         break;
     case FIELD_APP_EDITING_TIME:
-        res.i32 = GetXmlIntValue(appXml, "TotalTime");
+        res.i32 = cachedParts.appEditingTime;
         res.type = FieldResult::Int32;
         break;
     case FIELD_APP_PAGES:
-        res.i32 = GetXmlIntValue(appXml, "Pages");
+        res.i32 = cachedParts.appPages;
         res.type = res.i32 == 0 ? FieldResult::Empty : FieldResult::Int32;
         break;
     case FIELD_APP_PARAGRAPHS:
-        res.i32 = GetXmlIntValue(appXml, "Paragraphs");
+        res.i32 = cachedParts.appParagraphs;
         res.type = res.i32 == 0 ? FieldResult::Empty : FieldResult::Int32;
         break;
     case FIELD_APP_LINES:
-        res.i32 = GetXmlIntValue(appXml, "Lines");
+        res.i32 = cachedParts.appLines;
         res.type = res.i32 == 0 ? FieldResult::Empty : FieldResult::Int32;
         break;
     case FIELD_APP_WORDS:
-        res.i32 = GetXmlIntValue(appXml, "Words");
+        res.i32 = cachedParts.appWords;
         res.type = res.i32 == 0 ? FieldResult::Empty : FieldResult::Int32;
         break;
     case FIELD_APP_CHARACTERS:
-        res.i32 = GetXmlIntValue(appXml, "Characters");
+        res.i32 = cachedParts.appCharacters;
         res.type = res.i32 == 0 ? FieldResult::Empty : FieldResult::Int32;
         break;
     case FIELD_COMPATMODE:
-        res.b = IsCompatibilityModeEnabled(settingsXml);
+        res.b = cachedParts.compatibilityMode;
         res.type = FieldResult::Boolean;
         break;
     case FIELD_HIDDEN_TEXT:
-        res.b = HasHiddenTextInDocumentXml(ansiPath.c_str());
+        res.b = cachedParts.hiddenText;
         res.type = FieldResult::Boolean;
         break;
     case FIELD_COMMENTS:
-        res.i32 = CountComments(commentsXml);
+        res.i32 = cachedParts.commentsCount;
         res.type = FieldResult::Int32;
         break;
     case FIELD_DOCUMENT_PROTECTION:
     {
-        if (settingsXml.empty()) {
+        if (cachedParts.settingsXml.empty()) {
             res.s = TranslatePluginText("No protection");
             res.type = FieldResult::StringUtf8;
             break;
         }
 
         tinyxml2::XMLDocument doc;
-        if (doc.Parse(settingsXml.c_str()) != tinyxml2::XML_SUCCESS) {
+        if (doc.Parse(cachedParts.settingsXml.c_str()) != tinyxml2::XML_SUCCESS) {
             res.s = TranslatePluginText("Error parsing settings.xml");
             res.type = FieldResult::StringUtf8;
             break;
@@ -1303,11 +1371,11 @@ FieldResult GetFieldResult(const std::string& ansiPath, int fieldIndex, int /*un
         break;
     }
     case FIELD_AUTO_UPDATE_STYLES:
-        res.i32 = IsAutoUpdateStylesEnabled(settingsXml) ? 0 : 1;
+        res.i32 = cachedParts.autoUpdateStyles ? 0 : 1;
         res.type = FieldResult::Int32;
         break;
     case FIELD_ANONYMISATION:
-        res.i32 = GetAnonymisedFlags(settingsXml);
+        res.i32 = cachedParts.anonymisationFlags;
         res.type = FieldResult::Int32;
         break;
     case FIELD_TRACKED_CHANGES:
@@ -1315,7 +1383,7 @@ FieldResult GetFieldResult(const std::string& ansiPath, int fieldIndex, int /*un
         res.type = FieldResult::Boolean;
         break;
     case FIELD_TRACK_CHANGES_ENABLED_DISABLED:
-        res.i32 = IsTrackChangesEnabled(settingsXml) ? 0 : 1;
+        res.i32 = cachedParts.trackChangesEnabled ? 0 : 1;
         res.type = FieldResult::Int32;
         break;
     case FIELD_AUTHORS:
