@@ -4527,9 +4527,6 @@ mz_bool mz_zip_add_mem_to_archive_file_in_place_v2(const char *pZip_filename, co
 
     if ((!status) && (created_new_archive))
     {
-        /* It's a new archive and something went wrong, so just delete it. */
-        int ignoredStatus = MZ_DELETE_FILE(pZip_filename);
-        (void)ignoredStatus;
     }
 
     if (pErr)
