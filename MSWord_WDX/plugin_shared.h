@@ -163,6 +163,7 @@ void ClearCache();
 bool IsCanceled();
 
 bool ExtractFileFromZip(const char* zipPath, const char* fileNameInZip, std::string& output);
+bool ExtractRawFileFromZip(const char* zipPath, const char* fileNameInZip, std::string& output);
 bool WidePathToAnsi(const WCHAR* wpath, std::string& out);
 bool Utf8ToWideString(const std::string& in, std::wstring& out);
 std::string WideToUtf8(const std::wstring& wstr);

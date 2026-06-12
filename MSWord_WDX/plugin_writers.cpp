@@ -4,12 +4,16 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <cstdlib>
 #include <functional>
 #include <map>
 #include <vector>
 
 namespace {
+
+bool IsXmlWhitespace(char ch);
+std::string EncodeXmlAttributeValue(const std::string& value, char quote);
 
 std::vector<std::wstring> SplitLines(const std::wstring& text)
 {
@@ -92,7 +96,14 @@ void ParseAuthorRenamePayload(const std::wstring& encoded, std::vector<AuthorRen
 
 bool SaveReplacementsToDocx(const std::string& path, const std::map<std::string, std::string>& replacements)
 {
-    std::string tmpPath = path + ".tmp";
+    char suffix[64];
+    snprintf(suffix, sizeof(suffix), ".%lu.%lu.tmp", static_cast<unsigned long>(GetCurrentProcessId()), static_cast<unsigned long>(GetTickCount()));
+    std::string tmpPath = path + suffix;
+
+    auto fail = [&]() {
+        DeleteFileA(tmpPath.c_str());
+        return false;
+    };
 
     mz_zip_archive reader{};
     if (!mz_zip_reader_init_file(&reader, path.c_str(), 0)) return false;
@@ -100,7 +111,7 @@ bool SaveReplacementsToDocx(const std::string& path, const std::map<std::string,
     mz_zip_archive writer{};
     if (!mz_zip_writer_init_file(&writer, tmpPath.c_str(), 0)) {
         mz_zip_reader_end(&reader);
-        return false;
+        return fail();
     }
 
     mz_uint numFiles = mz_zip_reader_get_num_files(&reader);
@@ -116,13 +127,13 @@ bool SaveReplacementsToDocx(const std::string& path, const std::map<std::string,
             if (!mz_zip_writer_add_mem(&writer, name.c_str(), data.data(), data.size(), MZ_DEFAULT_COMPRESSION)) {
                 mz_zip_writer_end(&writer);
                 mz_zip_reader_end(&reader);
-                return false;
+                return fail();
             }
         }
         else if (!mz_zip_writer_add_from_zip_reader(&writer, &reader, i)) {
             mz_zip_writer_end(&writer);
             mz_zip_reader_end(&reader);
-            return false;
+            return fail();
         }
     }
 
@@ -141,7 +152,7 @@ bool SaveReplacementsToDocx(const std::string& path, const std::map<std::string,
             if (!mz_zip_writer_add_mem(&writer, kv.first.c_str(), kv.second.data(), kv.second.size(), MZ_DEFAULT_COMPRESSION)) {
                 mz_zip_writer_end(&writer);
                 mz_zip_reader_end(&reader);
-                return false;
+                return fail();
             }
         }
     }
@@ -149,33 +160,17 @@ bool SaveReplacementsToDocx(const std::string& path, const std::map<std::string,
     if (!mz_zip_writer_finalize_archive(&writer)) {
         mz_zip_writer_end(&writer);
         mz_zip_reader_end(&reader);
-        return false;
+        return fail();
     }
 
     mz_zip_writer_end(&writer);
     mz_zip_reader_end(&reader);
 
-    return MoveFileExA(tmpPath.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED) != FALSE;
-}
+    if (MoveFileExA(tmpPath.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED) == FALSE) {
+        return fail();
+    }
 
-bool UpdateSettingsXml(const std::string& ansiPath, const std::function<bool(tinyxml2::XMLDocument&, tinyxml2::XMLElement*)>& mutator)
-{
-    std::string settingsXml;
-    if (!ExtractFileFromZip(ansiPath.c_str(), "word/settings.xml", settingsXml)) return false;
-
-    tinyxml2::XMLDocument doc;
-    if (doc.Parse(settingsXml.c_str()) != tinyxml2::XML_SUCCESS) return false;
-
-    tinyxml2::XMLElement* root = doc.FirstChildElement("w:settings");
-    if (!root) return false;
-
-    if (!mutator(doc, root)) return false;
-
-    tinyxml2::XMLPrinter printer(nullptr, true);
-    doc.Accept(&printer);
-    bool saved = SaveXmlToZip(ansiPath.c_str(), "word/settings.xml", printer.CStr());
-    if (saved) ClearCache();
-    return saved;
+    return true;
 }
 
 int GetSettingsElementPriority(const char* name)
@@ -200,21 +195,237 @@ int GetSettingsElementPriority(const char* name)
     return 999;
 }
 
-void InsertSettingsElement(tinyxml2::XMLElement* root, tinyxml2::XMLElement* newEl)
+std::string GetXmlNameAt(const std::string& xml, size_t nameStart)
 {
-    if (!root || !newEl) return;
-    int newRank = GetSettingsElementPriority(newEl->Name());
+    size_t pos = nameStart;
+    while (pos < xml.size() && !IsXmlWhitespace(xml[pos]) && xml[pos] != '/' && xml[pos] != '>') ++pos;
+    return xml.substr(nameStart, pos - nameStart);
+}
 
-    for (tinyxml2::XMLElement* child = root->FirstChildElement(); child; child = child->NextSiblingElement()) {
-        if (GetSettingsElementPriority(child->Name()) > newRank) {
-            tinyxml2::XMLNode* prev = child->PreviousSibling();
-            if (prev) root->InsertAfterChild(prev, newEl);
-            else root->InsertFirstChild(newEl);
-            return;
+bool IsXmlNameEnd(char ch)
+{
+    return IsXmlWhitespace(ch) || ch == '/' || ch == '>';
+}
+
+size_t FindTagEnd(const std::string& xml, size_t tagStart)
+{
+    char quote = '\0';
+    for (size_t i = tagStart; i < xml.size(); ++i) {
+        char ch = xml[i];
+        if (quote) {
+            if (ch == quote) quote = '\0';
+        }
+        else if (ch == '"' || ch == '\'') {
+            quote = ch;
+        }
+        else if (ch == '>') {
+            return i;
         }
     }
+    return std::string::npos;
+}
 
-    root->InsertEndChild(newEl);
+bool IsSelfClosingTag(const std::string& xml, size_t tagStart, size_t tagEnd)
+{
+    size_t pos = tagEnd;
+    while (pos > tagStart && IsXmlWhitespace(xml[pos - 1])) --pos;
+    return pos > tagStart && xml[pos - 1] == '/';
+}
+
+bool FindElementRangeByNames(const std::string& xml, const std::vector<std::string>& names, size_t searchStart, size_t searchEnd, size_t& elementStart, size_t& elementEnd, std::string* matchedName = nullptr)
+{
+    size_t pos = searchStart;
+    while ((pos = xml.find('<', pos)) != std::string::npos && pos < searchEnd) {
+        if (pos + 1 >= searchEnd || xml[pos + 1] == '/' || xml[pos + 1] == '?' || xml[pos + 1] == '!') {
+            ++pos;
+            continue;
+        }
+
+        std::string name = GetXmlNameAt(xml, pos + 1);
+        bool wanted = false;
+        for (const std::string& candidate : names) {
+            if (name == candidate) {
+                wanted = true;
+                break;
+            }
+        }
+
+        if (!wanted) {
+            ++pos;
+            continue;
+        }
+
+        size_t tagEnd = FindTagEnd(xml, pos);
+        if (tagEnd == std::string::npos || tagEnd >= searchEnd) return false;
+
+        elementStart = pos;
+        if (IsSelfClosingTag(xml, pos, tagEnd)) {
+            elementEnd = tagEnd + 1;
+        }
+        else {
+            std::string closingTag = "</" + name + ">";
+            size_t closeStart = xml.find(closingTag, tagEnd + 1);
+            if (closeStart == std::string::npos || closeStart >= searchEnd) return false;
+            elementEnd = closeStart + closingTag.size();
+        }
+
+        if (matchedName) *matchedName = name;
+        return true;
+    }
+
+    return false;
+}
+
+bool FindSettingsRoot(const std::string& xml, size_t& contentStart, size_t& contentEnd)
+{
+    size_t rootStart = 0;
+    size_t rootEnd = 0;
+    std::string rootName;
+    if (!FindElementRangeByNames(xml, { "w:settings", "settings" }, 0, xml.size(), rootStart, rootEnd, &rootName)) return false;
+
+    size_t openEnd = FindTagEnd(xml, rootStart);
+    if (openEnd == std::string::npos || openEnd + 1 > rootEnd) return false;
+
+    std::string closeTag = "</" + rootName + ">";
+    if (rootEnd < closeTag.size()) return false;
+
+    contentStart = openEnd + 1;
+    contentEnd = rootEnd - closeTag.size();
+    return contentStart <= contentEnd;
+}
+
+bool FindSettingsChild(const std::string& xml, const std::vector<std::string>& names, size_t& elementStart, size_t& elementEnd)
+{
+    size_t contentStart = 0;
+    size_t contentEnd = 0;
+    if (!FindSettingsRoot(xml, contentStart, contentEnd)) return false;
+    return FindElementRangeByNames(xml, names, contentStart, contentEnd, elementStart, elementEnd);
+}
+
+size_t FindSettingsInsertPosition(const std::string& xml, const char* newElementName)
+{
+    size_t contentStart = 0;
+    size_t contentEnd = 0;
+    if (!FindSettingsRoot(xml, contentStart, contentEnd)) return std::string::npos;
+
+    int newRank = GetSettingsElementPriority(newElementName);
+    size_t pos = contentStart;
+    while ((pos = xml.find('<', pos)) != std::string::npos && pos < contentEnd) {
+        if (pos + 1 >= contentEnd || xml[pos + 1] == '/' || xml[pos + 1] == '?' || xml[pos + 1] == '!') {
+            ++pos;
+            continue;
+        }
+
+        std::string name = GetXmlNameAt(xml, pos + 1);
+        if (GetSettingsElementPriority(name.c_str()) > newRank) return pos;
+
+        size_t childStart = 0;
+        size_t childEnd = 0;
+        if (!FindElementRangeByNames(xml, { name }, pos, contentEnd, childStart, childEnd)) return std::string::npos;
+        pos = childEnd;
+    }
+
+    return contentEnd;
+}
+
+bool SaveSettingsXml(const std::string& ansiPath, const std::string& settingsXml)
+{
+    bool saved = SaveXmlToZip(ansiPath.c_str(), "word/settings.xml", settingsXml);
+    if (saved) ClearCache();
+    return saved;
+}
+
+bool SetSettingsElementXml(std::string& settingsXml, const std::vector<std::string>& names, const char* insertName, const std::string& elementXml, bool enable)
+{
+    size_t elementStart = 0;
+    size_t elementEnd = 0;
+    if (FindSettingsChild(settingsXml, names, elementStart, elementEnd)) {
+        if (enable) {
+            settingsXml.replace(elementStart, elementEnd - elementStart, elementXml);
+        }
+        else {
+            settingsXml.erase(elementStart, elementEnd - elementStart);
+        }
+        return true;
+    }
+
+    if (!enable) return true;
+
+    size_t insertPos = FindSettingsInsertPosition(settingsXml, insertName);
+    if (insertPos == std::string::npos) return false;
+    settingsXml.insert(insertPos, elementXml);
+    return true;
+}
+
+bool UpdateSettingsOnOffElement(const std::string& ansiPath, const char* localName, bool enable)
+{
+    std::string settingsXml;
+    if (!ExtractRawFileFromZip(ansiPath.c_str(), "word/settings.xml", settingsXml)) return false;
+
+    std::string fullName = std::string("w:") + localName;
+    std::string elementXml = "<" + fullName + " w:val=\"true\"/>";
+    if (!SetSettingsElementXml(settingsXml, { fullName, localName }, fullName.c_str(), elementXml, enable)) return false;
+
+    return SaveSettingsXml(ansiPath, settingsXml);
+}
+
+bool UpdateAnonymisationElements(const std::string& ansiPath, bool removePI, bool removeDate)
+{
+    std::string settingsXml;
+    if (!ExtractRawFileFromZip(ansiPath.c_str(), "word/settings.xml", settingsXml)) return false;
+
+    if (!SetSettingsElementXml(settingsXml,
+        { "w:removePersonalInformation", "removePersonalInformation" },
+        "w:removePersonalInformation",
+        "<w:removePersonalInformation w:val=\"true\"/>",
+        removePI)) {
+        return false;
+    }
+
+    if (!SetSettingsElementXml(settingsXml,
+        { "w:removeDateAndTime", "removeDateAndTime" },
+        "w:removeDateAndTime",
+        "<w:removeDateAndTime w:val=\"true\"/>",
+        removeDate)) {
+        return false;
+    }
+
+    return SaveSettingsXml(ansiPath, settingsXml);
+}
+
+std::string BuildDocumentProtectionXml(const std::string& editVal, const std::string& hashHex)
+{
+    std::string xml = "<w:documentProtection w:edit=\"" + EncodeXmlAttributeValue(editVal, '"') + "\" w:enforcement=\"1\"";
+    if (!hashHex.empty()) {
+        xml += " w:cryptAlgorithmClass=\"hash\" w:cryptAlgorithmType=\"typeAny\" w:cryptAlgorithmSid=\"1\" w:cryptSpinCount=\"0\" w:hash=\"";
+        xml += EncodeXmlAttributeValue(hashHex, '"');
+        xml += "\" w:salt=\"\"";
+    }
+    xml += "/>";
+    return xml;
+}
+
+bool UpdateDocumentProtectionElement(const std::string& ansiPath, const std::string& mode, const std::string& hashHex)
+{
+    std::string settingsXml;
+    if (!ExtractRawFileFromZip(ansiPath.c_str(), "word/settings.xml", settingsXml)) return false;
+
+    if (mode == "No protection") {
+        if (!SetSettingsElementXml(settingsXml, { "w:documentProtection", "documentProtection" }, "w:documentProtection", std::string(), false)) return false;
+        return SaveSettingsXml(ansiPath, settingsXml);
+    }
+
+    const char* editVal =
+        mode == "Read-only" ? "readOnly" :
+        mode == "Filling in forms" ? "forms" :
+        mode == "Comments" ? "comments" :
+        mode == "Tracked changes" ? "trackedChanges" : nullptr;
+    if (!editVal) return false;
+
+    std::string elementXml = BuildDocumentProtectionXml(editVal, hashHex);
+    if (!SetSettingsElementXml(settingsXml, { "w:documentProtection", "documentProtection" }, "w:documentProtection", elementXml, true)) return false;
+
+    return SaveSettingsXml(ansiPath, settingsXml);
 }
 
 bool AnsiToWideAcp(const char* src, std::wstring& out)
@@ -550,31 +761,33 @@ int RunContentSetValueW(WCHAR* fileName, int fieldIndex, int unitIndex, int fiel
 
         if (isCore) {
             std::string coreXml;
-            if (ExtractFileFromZip(ansiPath.c_str(), "docProps/core.xml", coreXml)) {
-                const char* elemName =
-                    fieldIndex == FIELD_CORE_TITLE ? "dc:title" :
-                    fieldIndex == FIELD_CORE_SUBJECT ? "dc:subject" :
-                    fieldIndex == FIELD_CORE_CREATOR ? "dc:creator" :
-                    fieldIndex == FIELD_CORE_KEYWORDS ? "cp:keywords" :
-                    "dc:description";
+            if (!ExtractRawFileFromZip(ansiPath.c_str(), "docProps/core.xml", coreXml)) return ft_fileerror;
 
-                if (SetXmlStringValue(coreXml, elemName, value) && SaveXmlToZip(ansiPath.c_str(), "docProps/core.xml", coreXml)) {
-                    ClearCache();
-                }
+            const char* elemName =
+                fieldIndex == FIELD_CORE_TITLE ? "dc:title" :
+                fieldIndex == FIELD_CORE_SUBJECT ? "dc:subject" :
+                fieldIndex == FIELD_CORE_CREATOR ? "dc:creator" :
+                fieldIndex == FIELD_CORE_KEYWORDS ? "cp:keywords" :
+                "dc:description";
+
+            if (!SetXmlStringValue(coreXml, elemName, value) || !SaveXmlToZip(ansiPath.c_str(), "docProps/core.xml", coreXml)) {
+                return ft_fileerror;
             }
+            ClearCache();
         }
         else {
             std::string appXml;
-            if (ExtractFileFromZip(ansiPath.c_str(), "docProps/app.xml", appXml)) {
-                const char* elemName =
-                    fieldIndex == FIELD_APP_MANAGER ? "Manager" :
-                    fieldIndex == FIELD_APP_COMPANY ? "Company" :
-                    "HyperlinkBase";
+            if (!ExtractRawFileFromZip(ansiPath.c_str(), "docProps/app.xml", appXml)) return ft_fileerror;
 
-                if (SetXmlStringValue(appXml, elemName, value) && SaveXmlToZip(ansiPath.c_str(), "docProps/app.xml", appXml)) {
-                    ClearCache();
-                }
+            const char* elemName =
+                fieldIndex == FIELD_APP_MANAGER ? "Manager" :
+                fieldIndex == FIELD_APP_COMPANY ? "Company" :
+                "HyperlinkBase";
+
+            if (!SetXmlStringValue(appXml, elemName, value) || !SaveXmlToZip(ansiPath.c_str(), "docProps/app.xml", appXml)) {
+                return ft_fileerror;
             }
+            ClearCache();
         }
         return ft_setsuccess;
     }
@@ -589,27 +802,27 @@ int RunContentSetValueW(WCHAR* fileName, int fieldIndex, int unitIndex, int fiel
         if (newValue.empty()) return ft_fieldempty;
 
         std::string coreXml;
-        if (ExtractFileFromZip(ansiPath.c_str(), "docProps/core.xml", coreXml)) {
-            const char* elemName =
-                fieldIndex == FIELD_CORE_CREATED_DATE ? "dcterms:created" :
-                fieldIndex == FIELD_CORE_MODIFIED_DATE ? "dcterms:modified" :
-                "cp:lastPrinted";
+        if (!ExtractRawFileFromZip(ansiPath.c_str(), "docProps/core.xml", coreXml)) return ft_fileerror;
+        const char* elemName =
+            fieldIndex == FIELD_CORE_CREATED_DATE ? "dcterms:created" :
+            fieldIndex == FIELD_CORE_MODIFIED_DATE ? "dcterms:modified" :
+            "cp:lastPrinted";
 
-            if (SetXmlStringValue(coreXml, elemName, newValue) && SaveXmlToZip(ansiPath.c_str(), "docProps/core.xml", coreXml)) {
-                ClearCache();
-            }
+        if (!SetXmlStringValue(coreXml, elemName, newValue) || !SaveXmlToZip(ansiPath.c_str(), "docProps/core.xml", coreXml)) {
+            return ft_fileerror;
         }
+        ClearCache();
         return ft_setsuccess;
     }
     case FIELD_CORE_LAST_MODIFIED_BY:
     {
         std::string userName = FieldValueToUtf8(fieldType, fieldValue);
         std::string coreXml;
-        if (ExtractFileFromZip(ansiPath.c_str(), "docProps/core.xml", coreXml)) {
-            if (SetXmlStringValue(coreXml, "cp:lastModifiedBy", userName) && SaveXmlToZip(ansiPath.c_str(), "docProps/core.xml", coreXml)) {
-                ClearCache();
-            }
+        if (!ExtractRawFileFromZip(ansiPath.c_str(), "docProps/core.xml", coreXml)) return ft_fileerror;
+        if (!SetXmlStringValue(coreXml, "cp:lastModifiedBy", userName) || !SaveXmlToZip(ansiPath.c_str(), "docProps/core.xml", coreXml)) {
+            return ft_fileerror;
         }
+        ClearCache();
         return ft_setsuccess;
     }
     case FIELD_CORE_REVISION_NUMBER:
@@ -617,13 +830,13 @@ int RunContentSetValueW(WCHAR* fileName, int fieldIndex, int unitIndex, int fiel
         if (!fieldValue) return ft_fieldempty;
         int revision = *static_cast<const int*>(fieldValue);
         std::string coreXml;
-        if (ExtractFileFromZip(ansiPath.c_str(), "docProps/core.xml", coreXml)) {
-            char buf[16];
-            snprintf(buf, sizeof(buf), "%d", revision);
-            if (SetXmlStringValue(coreXml, "cp:revision", buf) && SaveXmlToZip(ansiPath.c_str(), "docProps/core.xml", coreXml)) {
-                ClearCache();
-            }
+        if (!ExtractRawFileFromZip(ansiPath.c_str(), "docProps/core.xml", coreXml)) return ft_fileerror;
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%d", revision);
+        if (!SetXmlStringValue(coreXml, "cp:revision", buf) || !SaveXmlToZip(ansiPath.c_str(), "docProps/core.xml", coreXml)) {
+            return ft_fileerror;
         }
+        ClearCache();
         return ft_setsuccess;
     }
     case FIELD_APP_EDITING_TIME:
@@ -631,13 +844,13 @@ int RunContentSetValueW(WCHAR* fileName, int fieldIndex, int unitIndex, int fiel
         if (!fieldValue) return ft_fieldempty;
         int editingTime = *static_cast<const int*>(fieldValue);
         std::string appXml;
-        if (ExtractFileFromZip(ansiPath.c_str(), "docProps/app.xml", appXml)) {
-            char buf[16];
-            snprintf(buf, sizeof(buf), "%d", editingTime);
-            if (SetXmlStringValue(appXml, "TotalTime", buf) && SaveXmlToZip(ansiPath.c_str(), "docProps/app.xml", appXml)) {
-                ClearCache();
-            }
+        if (!ExtractRawFileFromZip(ansiPath.c_str(), "docProps/app.xml", appXml)) return ft_fileerror;
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%d", editingTime);
+        if (!SetXmlStringValue(appXml, "TotalTime", buf) || !SaveXmlToZip(ansiPath.c_str(), "docProps/app.xml", appXml)) {
+            return ft_fileerror;
         }
+        ClearCache();
         return ft_setsuccess;
     }
     case FIELD_AUTO_UPDATE_STYLES:
@@ -650,20 +863,7 @@ int RunContentSetValueW(WCHAR* fileName, int fieldIndex, int unitIndex, int fiel
         bool enable = idx == 0;
         DbgLog("FIELD_AUTO_UPDATE_STYLES: idx=%d enable=%d\n", idx, static_cast<int>(enable));
 
-        bool saved = UpdateSettingsXml(ansiPath, [&](tinyxml2::XMLDocument& doc, tinyxml2::XMLElement* root) {
-            tinyxml2::XMLElement* el = root->FirstChildElement("w:linkStyles");
-            if (enable) {
-                if (!el) {
-                    el = doc.NewElement("w:linkStyles");
-                    InsertSettingsElement(root, el);
-                }
-                el->SetAttribute("w:val", "true");
-            }
-            else if (el) {
-                root->DeleteChild(el);
-            }
-            return true;
-        });
+        bool saved = UpdateSettingsOnOffElement(ansiPath, "linkStyles", enable);
 
         DbgLog("FIELD_AUTO_UPDATE_STYLES: idx=%d enable=%d saved=%d\n", idx, static_cast<int>(enable), static_cast<int>(saved));
         return saved ? ft_setsuccess : ft_fileerror;
@@ -679,28 +879,7 @@ int RunContentSetValueW(WCHAR* fileName, int fieldIndex, int unitIndex, int fiel
         bool removePI = idx == 1 || idx == 3;
         bool removeDate = idx == 2 || idx == 3;
 
-        bool saved = UpdateSettingsXml(ansiPath, [&](tinyxml2::XMLDocument& doc, tinyxml2::XMLElement* root) {
-            auto setFlag = [&](const char* localName, bool enableFlag) {
-                std::string fullName = std::string("w:") + localName;
-                tinyxml2::XMLElement* el = root->FirstChildElement(fullName.c_str());
-                if (!el) el = root->FirstChildElement(localName);
-
-                if (enableFlag) {
-                    if (!el) {
-                        el = doc.NewElement(fullName.c_str());
-                        InsertSettingsElement(root, el);
-                    }
-                    el->SetAttribute("w:val", "true");
-                }
-                else if (el) {
-                    root->DeleteChild(el);
-                }
-            };
-
-            setFlag("removePersonalInformation", removePI);
-            setFlag("removeDateAndTime", removeDate);
-            return true;
-        });
+        bool saved = UpdateAnonymisationElements(ansiPath, removePI, removeDate);
 
         DbgLog("FIELD_ANONYMISATION: idx=%d removePI=%d removeDate=%d saved=%d\n", idx, static_cast<int>(removePI), static_cast<int>(removeDate), static_cast<int>(saved));
         return saved ? ft_setsuccess : ft_fileerror;
@@ -714,20 +893,7 @@ int RunContentSetValueW(WCHAR* fileName, int fieldIndex, int unitIndex, int fiel
         if (idx < 0) return ft_fieldempty;
         bool enable = idx == 0;
 
-        bool saved = UpdateSettingsXml(ansiPath, [&](tinyxml2::XMLDocument& doc, tinyxml2::XMLElement* root) {
-            tinyxml2::XMLElement* el = root->FirstChildElement("w:trackRevisions");
-            if (enable) {
-                if (!el) {
-                    el = doc.NewElement("w:trackRevisions");
-                    InsertSettingsElement(root, el);
-                }
-                el->SetAttribute("w:val", "true");
-            }
-            else if (el) {
-                root->DeleteChild(el);
-            }
-            return true;
-        });
+        bool saved = UpdateSettingsOnOffElement(ansiPath, "trackRevisions", enable);
 
         DbgLog("FIELD_TRACK_CHANGES_ENABLED_DISABLED: idx=%d enable=%d saved=%d\n", idx, static_cast<int>(enable), static_cast<int>(saved));
         return saved ? ft_setsuccess : ft_fileerror;
@@ -748,51 +914,28 @@ int RunContentSetValueW(WCHAR* fileName, int fieldIndex, int unitIndex, int fiel
             wPass = encoded.substr(sep + 1);
         }
 
-        bool saved = UpdateSettingsXml(ansiPath, [&](tinyxml2::XMLDocument& doc, tinyxml2::XMLElement* root) {
-            tinyxml2::XMLElement* prot = root->FirstChildElement("w:documentProtection");
-            if (prot) root->DeleteChild(prot);
-
-            if (mode == "No protection") return true;
-
-            const char* editVal =
-                mode == "Read-only" ? "readOnly" :
-                mode == "Filling in forms" ? "forms" :
-                mode == "Comments" ? "comments" :
-                mode == "Tracked changes" ? "trackedChanges" : nullptr;
-            if (!editVal) return false;
-
-            prot = doc.NewElement("w:documentProtection");
-            prot->SetAttribute("w:edit", editVal);
-            prot->SetAttribute("w:enforcement", "1");
-
-            if (!wPass.empty()) {
-                std::string pass;
-                for (wchar_t ch : wPass) pass += static_cast<char>(ch & 0xFF);
-                int len = static_cast<int>(pass.size());
-                WORD hash = 0;
-                for (int i = len - 1; i >= 0; --i) {
-                    hash ^= static_cast<WORD>(static_cast<unsigned char>(pass[i]));
-                    for (int bit = 0; bit < 7; ++bit) {
-                        if (hash & 0x4000) hash = static_cast<WORD>(((hash << 1) & 0x7FFF) ^ 0x6072);
-                        else hash = static_cast<WORD>((hash << 1) & 0x7FFF);
-                    }
+        std::string hashHex;
+        if (!wPass.empty()) {
+            std::string pass;
+            for (wchar_t ch : wPass) pass += static_cast<char>(ch & 0xFF);
+            int len = static_cast<int>(pass.size());
+            WORD hash = 0;
+            for (int i = len - 1; i >= 0; --i) {
+                hash ^= static_cast<WORD>(static_cast<unsigned char>(pass[i]));
+                for (int bit = 0; bit < 7; ++bit) {
+                    if (hash & 0x4000) hash = static_cast<WORD>(((hash << 1) & 0x7FFF) ^ 0x6072);
+                    else hash = static_cast<WORD>((hash << 1) & 0x7FFF);
                 }
-                hash ^= static_cast<WORD>(len);
-                hash ^= 0xCE4B;
-
-                char hashHex[8];
-                snprintf(hashHex, sizeof(hashHex), "%04X", static_cast<unsigned>(hash));
-                prot->SetAttribute("w:cryptAlgorithmClass", "hash");
-                prot->SetAttribute("w:cryptAlgorithmType", "typeAny");
-                prot->SetAttribute("w:cryptAlgorithmSid", "1");
-                prot->SetAttribute("w:cryptSpinCount", "0");
-                prot->SetAttribute("w:hash", hashHex);
-                prot->SetAttribute("w:salt", "");
             }
+            hash ^= static_cast<WORD>(len);
+            hash ^= 0xCE4B;
 
-            InsertSettingsElement(root, prot);
-            return true;
-        });
+            char hashBuf[8];
+            snprintf(hashBuf, sizeof(hashBuf), "%04X", static_cast<unsigned>(hash));
+            hashHex = hashBuf;
+        }
+
+        bool saved = UpdateDocumentProtectionElement(ansiPath, mode, hashHex);
 
         return saved ? ft_setsuccess : ft_fileerror;
     }

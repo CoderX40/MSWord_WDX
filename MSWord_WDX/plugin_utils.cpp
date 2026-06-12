@@ -621,7 +621,7 @@ std::string FileTimeToIso8601UTC(const FILETIME* ftUtc)
     return std::string(buf);
 }
 
-bool ExtractFileFromZip(const char* zipPath, const char* fileNameInZip, std::string& output)
+bool ExtractRawFileFromZip(const char* zipPath, const char* fileNameInZip, std::string& output)
 {
     mz_zip_archive zipArchive{};
     if (!mz_zip_reader_init_file(&zipArchive, zipPath, 0)) return false;
@@ -642,7 +642,12 @@ bool ExtractFileFromZip(const char* zipPath, const char* fileNameInZip, std::str
     output.assign(static_cast<char*>(p), uncompressedSize);
     mz_free(p);
     mz_zip_reader_end(&zipArchive);
+    return true;
+}
 
+bool ExtractFileFromZip(const char* zipPath, const char* fileNameInZip, std::string& output)
+{
+    if (!ExtractRawFileFromZip(zipPath, fileNameInZip, output)) return false;
     if (IsProbablyXml(fileNameInZip)) {
         if (!IsValidUtf8(output)) {
             std::string converted = AnsiToUtf8(output);
@@ -676,11 +681,30 @@ bool ExtractFileFromZip(const char* zipPath, const char* fileNameInZip, std::str
 bool WidePathToAnsi(const WCHAR* wpath, std::string& out)
 {
     if (!wpath) return false;
-    int len = WideCharToMultiByte(CP_ACP, 0, wpath, -1, nullptr, 0, nullptr, nullptr);
-    if (len <= 0) return false;
+    BOOL usedDefault = FALSE;
+    int len = WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, wpath, -1, nullptr, 0, nullptr, &usedDefault);
+    if (len <= 0 || usedDefault) {
+        DWORD shortLen = GetShortPathNameW(wpath, nullptr, 0);
+        if (shortLen == 0) return false;
+
+        std::wstring shortPath(static_cast<size_t>(shortLen), L'\0');
+        DWORD written = GetShortPathNameW(wpath, &shortPath[0], shortLen);
+        if (written == 0 || written >= shortLen) return false;
+        shortPath.resize(written);
+
+        usedDefault = FALSE;
+        len = WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, shortPath.c_str(), -1, nullptr, 0, nullptr, &usedDefault);
+        if (len <= 0 || usedDefault) return false;
+
+        std::string shortBuffer(static_cast<size_t>(len), '\0');
+        if (WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, shortPath.c_str(), -1, &shortBuffer[0], len, nullptr, nullptr) == 0) return false;
+
+        out.assign(shortBuffer.c_str());
+        return true;
+    }
 
     std::string buffer(static_cast<size_t>(len), '\0');
-    if (WideCharToMultiByte(CP_ACP, 0, wpath, -1, &buffer[0], len, nullptr, nullptr) == 0) return false;
+    if (WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, wpath, -1, &buffer[0], len, nullptr, nullptr) == 0) return false;
 
     out.assign(buffer.c_str());
     return true;
