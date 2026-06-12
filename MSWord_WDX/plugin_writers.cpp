@@ -166,6 +166,32 @@ bool SaveReplacementsToDocx(const std::string& path, const std::map<std::string,
     mz_zip_writer_end(&writer);
     mz_zip_reader_end(&reader);
 
+    auto validateEntry = [](mz_zip_archive& zip, const char* name) {
+        return mz_zip_reader_locate_file(&zip, name, nullptr, 0) >= 0;
+    };
+
+    mz_zip_archive validator{};
+    bool valid = mz_zip_reader_init_file(&validator, tmpPath.c_str(), 0) == MZ_TRUE;
+    if (valid) {
+        valid =
+            validateEntry(validator, "[Content_Types].xml") &&
+            validateEntry(validator, "_rels/.rels") &&
+            validateEntry(validator, "word/document.xml");
+
+        for (const auto& kv : replacements) {
+            if (!validateEntry(validator, kv.first.c_str())) {
+                valid = false;
+                break;
+            }
+        }
+    }
+
+    if (valid) mz_zip_reader_end(&validator);
+    if (!valid) {
+        if (validator.m_zip_mode != MZ_ZIP_MODE_INVALID) mz_zip_reader_end(&validator);
+        return fail();
+    }
+
     if (MoveFileExA(tmpPath.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED) == FALSE) {
         return fail();
     }
@@ -426,6 +452,131 @@ bool UpdateDocumentProtectionElement(const std::string& ansiPath, const std::str
     if (!SetSettingsElementXml(settingsXml, { "w:documentProtection", "documentProtection" }, "w:documentProtection", elementXml, true)) return false;
 
     return SaveSettingsXml(ansiPath, settingsXml);
+}
+
+std::string EncodeXmlTextValue(const std::string& value)
+{
+    std::string encoded;
+    encoded.reserve(value.size());
+
+    for (char ch : value) {
+        switch (ch) {
+        case '&': encoded += "&amp;"; break;
+        case '<': encoded += "&lt;"; break;
+        case '>': encoded += "&gt;"; break;
+        default: encoded.push_back(ch); break;
+        }
+    }
+
+    return encoded;
+}
+
+bool FindRootContentByNames(const std::string& xml, const std::vector<std::string>& rootNames, size_t& rootStart, size_t& openEnd, size_t& contentStart, size_t& contentEnd)
+{
+    size_t rootEnd = 0;
+    std::string rootName;
+    if (!FindElementRangeByNames(xml, rootNames, 0, xml.size(), rootStart, rootEnd, &rootName)) return false;
+
+    openEnd = FindTagEnd(xml, rootStart);
+    if (openEnd == std::string::npos || openEnd + 1 > rootEnd) return false;
+
+    std::string closeTag = "</" + rootName + ">";
+    if (rootEnd < closeTag.size()) return false;
+
+    contentStart = openEnd + 1;
+    contentEnd = rootEnd - closeTag.size();
+    return contentStart <= contentEnd;
+}
+
+bool EnsureRootNamespace(std::string& xml, size_t rootStart, size_t& openEnd, const char* prefix, const char* uri)
+{
+    if (!prefix || !*prefix || !uri || !*uri) return true;
+
+    std::string attrName = std::string("xmlns:") + prefix;
+    size_t nameStart = rootStart + 1;
+    std::string rootName = GetXmlNameAt(xml, nameStart);
+    size_t attrSearchStart = nameStart + rootName.size();
+
+    size_t pos = attrSearchStart;
+    while ((pos = xml.find(attrName, pos)) != std::string::npos && pos < openEnd) {
+        bool leftOk = pos == attrSearchStart || IsXmlWhitespace(xml[pos - 1]);
+        size_t right = pos + attrName.size();
+        bool rightOk = right < openEnd && (IsXmlWhitespace(xml[right]) || xml[right] == '=');
+        if (leftOk && rightOk) return true;
+        pos = right;
+    }
+
+    std::string attr = " " + attrName + "=\"" + EncodeXmlAttributeValue(uri, '"') + "\"";
+    xml.insert(nameStart + rootName.size(), attr);
+    openEnd += attr.size();
+    return true;
+}
+
+bool EnsureNamespaceForElement(std::string& xml, size_t rootStart, size_t& openEnd, const char* elementName)
+{
+    const char* colon = strchr(elementName, ':');
+    if (!colon) return true;
+
+    std::string prefix(elementName, colon - elementName);
+    if (prefix == "dc") return EnsureRootNamespace(xml, rootStart, openEnd, "dc", "http://purl.org/dc/elements/1.1/");
+    if (prefix == "cp") return EnsureRootNamespace(xml, rootStart, openEnd, "cp", "http://schemas.openxmlformats.org/package/2006/metadata/core-properties");
+    if (prefix == "dcterms") return EnsureRootNamespace(xml, rootStart, openEnd, "dcterms", "http://purl.org/dc/terms/");
+    return true;
+}
+
+bool SetDirectChildElementText(std::string& xml, const std::vector<std::string>& rootNames, const char* elementName, const std::string& value)
+{
+    size_t rootStart = 0;
+    size_t openEnd = 0;
+    size_t contentStart = 0;
+    size_t contentEnd = 0;
+    if (!FindRootContentByNames(xml, rootNames, rootStart, openEnd, contentStart, contentEnd)) return false;
+
+    std::string encoded = EncodeXmlTextValue(value);
+    size_t elementStart = 0;
+    size_t elementEnd = 0;
+    if (FindElementRangeByNames(xml, { elementName }, contentStart, contentEnd, elementStart, elementEnd)) {
+        size_t elementOpenEnd = FindTagEnd(xml, elementStart);
+        if (elementOpenEnd == std::string::npos || elementOpenEnd >= elementEnd) return false;
+
+        if (IsSelfClosingTag(xml, elementStart, elementOpenEnd)) {
+            size_t slash = elementOpenEnd;
+            while (slash > elementStart && IsXmlWhitespace(xml[slash - 1])) --slash;
+            if (slash <= elementStart || xml[slash - 1] != '/') return false;
+            size_t slashIndex = slash - 1;
+            xml.replace(slashIndex, elementOpenEnd - slashIndex + 1, std::string(">") + encoded + "</" + elementName + ">");
+        }
+        else {
+            std::string closeTag = "</" + std::string(elementName) + ">";
+            if (elementEnd < closeTag.size()) return false;
+            size_t valueStart = elementOpenEnd + 1;
+            size_t valueEnd = elementEnd - closeTag.size();
+            xml.replace(valueStart, valueEnd - valueStart, encoded);
+        }
+        return true;
+    }
+
+    if (!EnsureNamespaceForElement(xml, rootStart, openEnd, elementName)) return false;
+
+    if (!FindRootContentByNames(xml, rootNames, rootStart, openEnd, contentStart, contentEnd)) return false;
+    std::string elementXml = "<" + std::string(elementName) + ">" + encoded + "</" + std::string(elementName) + ">";
+    xml.insert(contentEnd, elementXml);
+    return true;
+}
+
+bool SetPackageXmlStringValue(std::string& xmlContent, const char* fileNameInZip, const char* elementName, const std::string& value)
+{
+    if (!fileNameInZip || !elementName) return false;
+
+    if (strcmp(fileNameInZip, "docProps/core.xml") == 0) {
+        return SetDirectChildElementText(xmlContent, { "cp:coreProperties", "coreProperties" }, elementName, value);
+    }
+
+    if (strcmp(fileNameInZip, "docProps/app.xml") == 0) {
+        return SetDirectChildElementText(xmlContent, { "Properties" }, elementName, value);
+    }
+
+    return SetXmlStringValue(xmlContent, elementName, value);
 }
 
 bool AnsiToWideAcp(const char* src, std::wstring& out)
@@ -770,7 +921,7 @@ int RunContentSetValueW(WCHAR* fileName, int fieldIndex, int unitIndex, int fiel
                 fieldIndex == FIELD_CORE_KEYWORDS ? "cp:keywords" :
                 "dc:description";
 
-            if (!SetXmlStringValue(coreXml, elemName, value) || !SaveXmlToZip(ansiPath.c_str(), "docProps/core.xml", coreXml)) {
+            if (!SetPackageXmlStringValue(coreXml, "docProps/core.xml", elemName, value) || !SaveXmlToZip(ansiPath.c_str(), "docProps/core.xml", coreXml)) {
                 return ft_fileerror;
             }
             ClearCache();
@@ -784,7 +935,7 @@ int RunContentSetValueW(WCHAR* fileName, int fieldIndex, int unitIndex, int fiel
                 fieldIndex == FIELD_APP_COMPANY ? "Company" :
                 "HyperlinkBase";
 
-            if (!SetXmlStringValue(appXml, elemName, value) || !SaveXmlToZip(ansiPath.c_str(), "docProps/app.xml", appXml)) {
+            if (!SetPackageXmlStringValue(appXml, "docProps/app.xml", elemName, value) || !SaveXmlToZip(ansiPath.c_str(), "docProps/app.xml", appXml)) {
                 return ft_fileerror;
             }
             ClearCache();
@@ -808,7 +959,7 @@ int RunContentSetValueW(WCHAR* fileName, int fieldIndex, int unitIndex, int fiel
             fieldIndex == FIELD_CORE_MODIFIED_DATE ? "dcterms:modified" :
             "cp:lastPrinted";
 
-        if (!SetXmlStringValue(coreXml, elemName, newValue) || !SaveXmlToZip(ansiPath.c_str(), "docProps/core.xml", coreXml)) {
+        if (!SetPackageXmlStringValue(coreXml, "docProps/core.xml", elemName, newValue) || !SaveXmlToZip(ansiPath.c_str(), "docProps/core.xml", coreXml)) {
             return ft_fileerror;
         }
         ClearCache();
@@ -819,7 +970,7 @@ int RunContentSetValueW(WCHAR* fileName, int fieldIndex, int unitIndex, int fiel
         std::string userName = FieldValueToUtf8(fieldType, fieldValue);
         std::string coreXml;
         if (!ExtractRawFileFromZip(ansiPath.c_str(), "docProps/core.xml", coreXml)) return ft_fileerror;
-        if (!SetXmlStringValue(coreXml, "cp:lastModifiedBy", userName) || !SaveXmlToZip(ansiPath.c_str(), "docProps/core.xml", coreXml)) {
+        if (!SetPackageXmlStringValue(coreXml, "docProps/core.xml", "cp:lastModifiedBy", userName) || !SaveXmlToZip(ansiPath.c_str(), "docProps/core.xml", coreXml)) {
             return ft_fileerror;
         }
         ClearCache();
@@ -833,7 +984,7 @@ int RunContentSetValueW(WCHAR* fileName, int fieldIndex, int unitIndex, int fiel
         if (!ExtractRawFileFromZip(ansiPath.c_str(), "docProps/core.xml", coreXml)) return ft_fileerror;
         char buf[16];
         snprintf(buf, sizeof(buf), "%d", revision);
-        if (!SetXmlStringValue(coreXml, "cp:revision", buf) || !SaveXmlToZip(ansiPath.c_str(), "docProps/core.xml", coreXml)) {
+        if (!SetPackageXmlStringValue(coreXml, "docProps/core.xml", "cp:revision", buf) || !SaveXmlToZip(ansiPath.c_str(), "docProps/core.xml", coreXml)) {
             return ft_fileerror;
         }
         ClearCache();
@@ -847,7 +998,7 @@ int RunContentSetValueW(WCHAR* fileName, int fieldIndex, int unitIndex, int fiel
         if (!ExtractRawFileFromZip(ansiPath.c_str(), "docProps/app.xml", appXml)) return ft_fileerror;
         char buf[16];
         snprintf(buf, sizeof(buf), "%d", editingTime);
-        if (!SetXmlStringValue(appXml, "TotalTime", buf) || !SaveXmlToZip(ansiPath.c_str(), "docProps/app.xml", appXml)) {
+        if (!SetPackageXmlStringValue(appXml, "docProps/app.xml", "TotalTime", buf) || !SaveXmlToZip(ansiPath.c_str(), "docProps/app.xml", appXml)) {
             return ft_fileerror;
         }
         ClearCache();
