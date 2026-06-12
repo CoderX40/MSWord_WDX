@@ -3,6 +3,8 @@
 #include "plugin_shared.h"
 
 #include <algorithm>
+#include <cctype>
+#include <cstdlib>
 #include <functional>
 #include <map>
 #include <vector>
@@ -243,6 +245,171 @@ std::string FieldValueToUtf8(int fieldType, const void* fieldValue)
     return std::string();
 }
 
+bool IsXmlWhitespace(char ch)
+{
+    return ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n';
+}
+
+void AppendUtf8CodePoint(std::string& output, unsigned long codePoint)
+{
+    if (codePoint <= 0x7F) {
+        output.push_back(static_cast<char>(codePoint));
+    }
+    else if (codePoint <= 0x7FF) {
+        output.push_back(static_cast<char>(0xC0 | (codePoint >> 6)));
+        output.push_back(static_cast<char>(0x80 | (codePoint & 0x3F)));
+    }
+    else if (codePoint <= 0xFFFF) {
+        output.push_back(static_cast<char>(0xE0 | (codePoint >> 12)));
+        output.push_back(static_cast<char>(0x80 | ((codePoint >> 6) & 0x3F)));
+        output.push_back(static_cast<char>(0x80 | (codePoint & 0x3F)));
+    }
+    else if (codePoint <= 0x10FFFF) {
+        output.push_back(static_cast<char>(0xF0 | (codePoint >> 18)));
+        output.push_back(static_cast<char>(0x80 | ((codePoint >> 12) & 0x3F)));
+        output.push_back(static_cast<char>(0x80 | ((codePoint >> 6) & 0x3F)));
+        output.push_back(static_cast<char>(0x80 | (codePoint & 0x3F)));
+    }
+}
+
+std::string DecodeXmlAttributeValue(const std::string& value)
+{
+    std::string decoded;
+    decoded.reserve(value.size());
+
+    for (size_t i = 0; i < value.size(); ++i) {
+        if (value[i] != '&') {
+            decoded.push_back(value[i]);
+            continue;
+        }
+
+        size_t semi = value.find(';', i + 1);
+        if (semi == std::string::npos) {
+            decoded.push_back(value[i]);
+            continue;
+        }
+
+        std::string entity = value.substr(i + 1, semi - i - 1);
+        if (entity == "amp") decoded.push_back('&');
+        else if (entity == "lt") decoded.push_back('<');
+        else if (entity == "gt") decoded.push_back('>');
+        else if (entity == "quot") decoded.push_back('"');
+        else if (entity == "apos") decoded.push_back('\'');
+        else if (!entity.empty() && entity[0] == '#') {
+            char* end = nullptr;
+            unsigned long codePoint = 0;
+            if (entity.size() > 2 && (entity[1] == 'x' || entity[1] == 'X')) {
+                codePoint = strtoul(entity.c_str() + 2, &end, 16);
+            }
+            else {
+                codePoint = strtoul(entity.c_str() + 1, &end, 10);
+            }
+
+            if (end && *end == '\0') AppendUtf8CodePoint(decoded, codePoint);
+            else decoded.append(value, i, semi - i + 1);
+        }
+        else {
+            decoded.append(value, i, semi - i + 1);
+        }
+
+        i = semi;
+    }
+
+    return decoded;
+}
+
+std::string EncodeXmlAttributeValue(const std::string& value, char quote)
+{
+    std::string encoded;
+    encoded.reserve(value.size());
+
+    for (char ch : value) {
+        switch (ch) {
+        case '&': encoded += "&amp;"; break;
+        case '<': encoded += "&lt;"; break;
+        case '>': encoded += "&gt;"; break;
+        case '"':
+            if (quote == '"') encoded += "&quot;";
+            else encoded.push_back(ch);
+            break;
+        case '\'':
+            if (quote == '\'') encoded += "&apos;";
+            else encoded.push_back(ch);
+            break;
+        default:
+            encoded.push_back(ch);
+            break;
+        }
+    }
+
+    return encoded;
+}
+
+const std::string* FindAuthorReplacement(const std::string& author, const std::vector<AuthorRenameEntry>& renames, const std::string& replaceRemainingWith)
+{
+    for (const AuthorRenameEntry& rename : renames) {
+        if (rename.oldAuthor == author) return &rename.newAuthor;
+    }
+
+    return replaceRemainingWith.empty() ? nullptr : &replaceRemainingWith;
+}
+
+bool ReplaceAuthorAttributeInXml(std::string& xml, const char* attrName, const std::vector<AuthorRenameEntry>& renames, const std::string& replaceRemainingWith)
+{
+    bool modified = false;
+    size_t pos = 0;
+    const size_t attrLen = strlen(attrName);
+
+    while ((pos = xml.find(attrName, pos)) != std::string::npos) {
+        if (pos > 0 && !IsXmlWhitespace(xml[pos - 1])) {
+            pos += attrLen;
+            continue;
+        }
+
+        size_t cursor = pos + attrLen;
+        while (cursor < xml.size() && IsXmlWhitespace(xml[cursor])) ++cursor;
+        if (cursor >= xml.size() || xml[cursor] != '=') {
+            pos += attrLen;
+            continue;
+        }
+
+        ++cursor;
+        while (cursor < xml.size() && IsXmlWhitespace(xml[cursor])) ++cursor;
+        if (cursor >= xml.size() || (xml[cursor] != '"' && xml[cursor] != '\'')) {
+            pos += attrLen;
+            continue;
+        }
+
+        char quote = xml[cursor];
+        size_t valueStart = cursor + 1;
+        size_t valueEnd = xml.find(quote, valueStart);
+        if (valueEnd == std::string::npos) break;
+
+        std::string rawValue = xml.substr(valueStart, valueEnd - valueStart);
+        std::string decodedValue = DecodeXmlAttributeValue(rawValue);
+        const std::string* replacement = FindAuthorReplacement(decodedValue, renames, replaceRemainingWith);
+
+        if (replacement && *replacement != decodedValue) {
+            std::string encodedReplacement = EncodeXmlAttributeValue(*replacement, quote);
+            xml.replace(valueStart, valueEnd - valueStart, encodedReplacement);
+            modified = true;
+            pos = valueStart + encodedReplacement.size() + 1;
+        }
+        else {
+            pos = valueEnd + 1;
+        }
+    }
+
+    return modified;
+}
+
+bool ReplaceTrackedChangeAuthorAttributesInXml(std::string& xml, const std::vector<AuthorRenameEntry>& renames, const std::string& replaceRemainingWith)
+{
+    bool modified = ReplaceAuthorAttributeInXml(xml, "w:author", renames, replaceRemainingWith);
+    modified = ReplaceAuthorAttributeInXml(xml, "w:originalAuthor", renames, replaceRemainingWith) || modified;
+    return modified;
+}
+
 } // namespace
 
 bool SetXmlStringValue(std::string& xmlContent, const char* elementName, const std::string& value)
@@ -328,46 +495,8 @@ bool RenameTrackedChangeAuthorsBatch(const std::string& ansiPath, const std::vec
         std::string xml(static_cast<char*>(p), sz);
         mz_free(p);
 
-        tinyxml2::XMLDocument doc;
-        if (doc.Parse(xml.c_str()) != tinyxml2::XML_SUCCESS) continue;
-
-        bool modified = false;
-        std::function<void(tinyxml2::XMLElement*)> walk = [&](tinyxml2::XMLElement* elem) {
-            if (!elem) return;
-            for (const char* attr : { "w:author", "w:originalAuthor" }) {
-                const char* val = elem->Attribute(attr);
-                if (!val) continue;
-
-                const AuthorRenameEntry* matchedRename = nullptr;
-                for (const AuthorRenameEntry& rename : renames) {
-                    if (rename.oldAuthor == val) {
-                        matchedRename = &rename;
-                        break;
-                    }
-                }
-
-                if (matchedRename) {
-                    if (matchedRename->newAuthor != val) {
-                        elem->SetAttribute(attr, matchedRename->newAuthor.c_str());
-                        modified = true;
-                    }
-                }
-                else if (hasReplaceRemaining && replaceRemainingWith != val) {
-                    elem->SetAttribute(attr, replaceRemainingWith.c_str());
-                    modified = true;
-                }
-            }
-            for (tinyxml2::XMLElement* child = elem->FirstChildElement(); child; child = child->NextSiblingElement()) {
-                walk(child);
-            }
-        };
-
-        walk(doc.RootElement());
-
-        if (modified) {
-            tinyxml2::XMLPrinter printer(nullptr, true);
-            doc.Accept(&printer);
-            replacements[stat.m_filename] = printer.CStr();
+        if (ReplaceTrackedChangeAuthorAttributesInXml(xml, renames, hasReplaceRemaining ? replaceRemainingWith : std::string())) {
+            replacements[stat.m_filename] = xml;
         }
     }
 
